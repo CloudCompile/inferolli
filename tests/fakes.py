@@ -43,6 +43,10 @@ class FakeFollowup:
     def __init__(self):
         self.sent = []
 
+    @property
+    def mention(self):
+        return f"<#{self.id}>"
+
     async def send(self, content=None, **kw):
         self.sent.append((content, kw))
         return SimpleNamespace(id=1000 + len(self.sent))
@@ -82,6 +86,10 @@ class FakeMember:
         self.top_role = max(self.roles, key=lambda r: r.position,
                             default=FakeRole(0, "@everyone", 0))
 
+    @property
+    def mention(self):
+        return f"<@{self.id}>"
+
     def __str__(self):
         return self.display_name
 
@@ -94,6 +102,13 @@ class FakeMessage:
         self.author = None
         self.attachments = []
         self.pinned = False
+        self.deleted_by_bot = False
+
+    async def delete(self):
+        # mimics discord.py: the only deletion affordance is this method — there
+        # is no `.deleted` attribute to poll before deleting
+        self.deleted_by_bot = True
+        return None
 
     async def edit(self, content=None, **kw):
         self.content = content
@@ -114,6 +129,10 @@ class FakeChannel:
         self.last_message_id = 0
         self._history = list(history)
         self._existing = {}
+
+    @property
+    def mention(self):
+        return f"<#{self.id}>"
 
     def permissions_for(self, member):
         return FakePermissions()

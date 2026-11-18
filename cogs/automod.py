@@ -134,7 +134,7 @@ class AutoModCog(commands.Cog):
         delete = (severity == "high" and conf >= 0.85) or \
                  (severity == "medium" and conf >= 0.70) or \
                  (severity == "low" and conf >= 0.9 and strike_count >= 2)
-        if delete and not message.deleted:
+        if delete:
             try:
                 await message.delete()
                 acted.append("deleted")
@@ -188,7 +188,11 @@ class AutoModCog(commands.Cog):
         try:
             severity, conf, reason = await self._classify(message)
             log.info("automod verdict in #%s: %s (%.2f)", message.channel.name, severity, conf)
-            if severity != "clean" and not message.deleted:
+            if severity != "clean":
+                # NOTE: discord.py's Message has no `.deleted` attribute — the old
+                # check raised AttributeError here, so every flagged message
+                # escaped action and automod silently failed open. Attempt the
+                # delete and let the HTTPException tell us if it's already gone.
                 await self._act(message, severity, conf, reason, cfg,
                                 len(self.strikes.get((message.guild.id, message.author.id), [])))
         except AIError as e:
