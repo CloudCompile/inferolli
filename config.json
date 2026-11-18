@@ -53,8 +53,12 @@
   },
   "permissions": {
     "_comment": "Role ids that grant each tier. Discord permissions are also honoured (Administrator = admin, Moderate Members/Manage Messages = staff). Actions map to the minimum tier required.",
-    "admin_role_ids": [],
-    "staff_role_ids": [],
+    "admin_role_ids": [
+      "1565794638504136704"
+    ],
+    "staff_role_ids": [
+      "1565832623002091692"
+    ],
     "tier_actions": {
       "channel.create": "admin",
       "channel.rename": "admin",

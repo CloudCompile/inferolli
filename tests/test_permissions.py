@@ -101,6 +101,25 @@ class RepoConfigTests(unittest.TestCase):
         for action in ("member.warn", "member.mute", "member.kick", "member.ban"):
             self.assertEqual(actions[action], "staff", action)
 
+    def test_role_ids_are_configured_ints(self):
+        """A typo here silently demotes everyone, so pin the real guild roles."""
+        cfg = settings.load(force=True)["permissions"]
+        self.assertEqual(cfg["admin_role_ids"], ["1565794638504136704"])    # Admin
+        self.assertEqual(cfg["staff_role_ids"], ["1565832623002091692"])    # staff
+        for rid in cfg["admin_role_ids"] + cfg["staff_role_ids"]:
+            int(rid)   # must be a valid snowflake
+
+    def test_configured_roles_grant_the_tier(self):
+        from tests.fakes import FakeRole
+        admin_role = FakeRole(1565794638504136704, "Admin", 19)
+        staff_role = FakeRole(1565832623002091692, "staff", 20)
+
+        member = FakeMember(admin=False, roles=[staff_role])
+        self.assertEqual(permissions.tier_of(member), "staff")
+
+        owner = FakeMember(admin=False, roles=[staff_role, admin_role])
+        self.assertEqual(permissions.tier_of(owner), "admin")
+
 
 if __name__ == "__main__":
     unittest.main()
