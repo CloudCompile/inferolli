@@ -35,7 +35,6 @@ import httpx as _httpx
 
 OC_URL = "http://localhost:4096"
 OC_PORT = settings.get_int("opencode.port", 4096, env="OPENCODE_PORT")
-OC_AUTH = ("opencode", os.environ.get("OPENCODE_SERVER_PASSWORD", "inferolli-local-4096"))
 
 
 def _server_password(path: str = "/tmp/opencode-serve.log") -> str | None:
@@ -93,9 +92,16 @@ def _turn_finished(messages: list, user_msg_id: str | None) -> bool:
 
 
 def _auth():
-    """Basic-auth tuple: env password → the generated one from the log → the fixed default."""
-    pw = (os.environ.get("OPENCODE_SERVER_PASSWORD")
-          or _server_password()
+    """Basic-auth tuple for the local opencode server.
+
+    The generated password in the serve log is the ONLY reliable source: opencode
+    mints a fresh random password on every start and the watchdog restarts it, so
+    a password baked into the environment goes stale and every call 401s. (That is
+    exactly what happened — the primary reply engine was dead for hours while the
+    fallback chain silently covered for it.) Order: live log → env → default.
+    """
+    pw = (_server_password()
+          or os.environ.get("OPENCODE_SERVER_PASSWORD")
           or "inferolli-local-4096")
     return ("opencode", pw)
 

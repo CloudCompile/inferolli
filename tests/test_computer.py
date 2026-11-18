@@ -1,6 +1,7 @@
 """cogs/computer.py — the newest-first reply parser, auth resolution."""
 
 import os
+import pathlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -93,9 +94,27 @@ class AuthTests(unittest.TestCase):
     def test_missing_log_is_none(self):
         self.assertIsNone(computer._server_password("/nonexistent/nowhere.log"))
 
-    def test_env_password_wins(self):
-        with mock.patch.dict(os.environ, {"OPENCODE_SERVER_PASSWORD": "envpw"}):
+    def test_log_password_beats_env(self):
+        """The serve log is the truth; a fixed env password goes stale and 401s.
+
+        Production: start.sh exported a constant password, opencode minted a new
+        random one on every start, and every request to the local agent server
+        returned 401 — so the primary reply engine was dead and the fallback
+        chain quietly answered in its place.
+        """
+        with mock.patch.dict(os.environ, {"OPENCODE_SERVER_PASSWORD": "stale-env-pw"}), \
+             mock.patch.object(computer, "_server_password", lambda *a: "fresh-log-pw"):
+            self.assertEqual(computer._auth(), ("opencode", "fresh-log-pw"))
+
+    def test_env_still_used_when_log_unreadable(self):
+        with mock.patch.dict(os.environ, {"OPENCODE_SERVER_PASSWORD": "envpw"}), \
+             mock.patch.object(computer, "_server_password", lambda *a: None):
             self.assertEqual(computer._auth(), ("opencode", "envpw"))
+
+    def test_start_script_does_not_bake_a_password(self):
+        """A hardcoded password in start.sh is the bug that killed the engine."""
+        script = pathlib.Path(__file__).resolve().parents[1].joinpath("start.sh").read_text()
+        self.assertNotRegex(script, r"export OPENCODE_SERVER_PASSWORD=\S")
 
     def test_falls_back_to_log_then_default(self):
         with mock.patch.dict(os.environ, {"OPENCODE_SERVER_PASSWORD": ""}), \

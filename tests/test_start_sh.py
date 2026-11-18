@@ -37,8 +37,18 @@ class StartShTests(unittest.TestCase):
         self.assertIn("pgrep -f 'cloudflared tunnel'", self.text)
         self.assertIn("pgrep -f 'Xvfb :99'", self.text)
 
-    def test_opencode_auth_password_exported(self):
-        self.assertIn("OPENCODE_SERVER_PASSWORD=inferolli-local-4096", self.text)
+    def test_no_fixed_opencode_password_is_exported(self):
+        """opencode mints a new password each start.
+
+        This test used to assert the opposite — that start.sh exported a constant
+        password — which locked in the bug: the server ignored it, the client kept
+        sending it, every request 401'd, and the primary reply engine was dead.
+        """
+        self.assertNotRegex(self.text, r"export\s+OPENCODE_SERVER_PASSWORD=\S")
+        self.assertIn("unset OPENCODE_SERVER_PASSWORD", self.text)
+
+    def test_waits_for_the_generated_password_to_appear(self):
+        self.assertIn("server password", self.text)
 
     def test_env_sourced_before_opencode(self):
         env_line = self.text.index(". /bot/.env")

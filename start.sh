@@ -31,8 +31,15 @@ mkdir -p "$XDG_DATA_HOME"
 # opencode needs the provider keys — the secure envs don't reach the start command,
 # so source the restored .env (it's there: the launcher persists it at boot)
 set -a; . /bot/.env; set +a
-export OPENCODE_SERVER_PASSWORD=inferolli-local-4096   # localhost-only; the client sends it too
+# opencode mints its own password each start and prints it to the serve log; the
+# client reads it from there. Do NOT export a fixed one — a stale value means
+# every request 401s and the primary reply engine dies quietly.
+unset OPENCODE_SERVER_PASSWORD
 (nohup opencode serve --port 4096 > /tmp/opencode-serve.log 2>&1 &)
+for _ in $(seq 1 20); do
+  grep -q 'server password' /tmp/opencode-serve.log 2>/dev/null && break
+  sleep 0.5
+done
 
 # --- the stack watchdog: any dead piece gets revived (children of the start
 #     command survive; nothing exec-launched does — so this is the healer) ---
