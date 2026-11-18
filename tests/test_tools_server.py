@@ -12,9 +12,15 @@ class RunLoopTests(unittest.TestCase):
         return asyncio.run(coro)
 
     def _script(self, *responses):
-        """chat_for stub that yields the given dicts in order and records prompts."""
+        """chat_for stub that yields the given responses in order.
+
+        run_loop now asks for raw text (json_out=False) and parses it itself, so
+        dicts are serialised here — that keeps these tests exercising the real
+        parsing path instead of handing it a pre-parsed object.
+        """
+        import json as _json
         calls = []
-        queue = list(responses)
+        queue = [r if isinstance(r, str) else _json.dumps(r) for r in responses]
 
         async def fake_chat_for(job, messages, **kw):
             calls.append([m["content"] for m in messages])

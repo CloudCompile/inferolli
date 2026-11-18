@@ -71,6 +71,12 @@ Available tools:
 Use them when the answer isn't already in what you know: current events, prices,
 anything after your training, or specifics from other channels. Then answer in
 your normal voice — cite what you found naturally, don't announce tool use.
+
+FORMAT IS STRICT: your entire reply must be ONE JSON object — nothing before it,
+nothing after it, no XML, no <tool calls> tags, no prose around it. If you don't
+need a tool, just answer: {"reply": "..."}. Most messages need no tool at all —
+small talk, opinions, and anything you already know should go straight to
+{"reply": "..."}.
 """
 COMPUTER_TOOL = '  {"tool": "computer", "args": {"prompt": "..."}}     — delegate a task to your computer: bash, files, AND its live desktop (open a web page in chromium, click/type with xdotool, screenshot) — ADMIN requests only, quick tasks (90s cap)'
 
@@ -275,6 +281,83 @@ async def docs_search(query: str) -> str:
 
 # ---------- the loop ----------
 
+def _unwrap_tool_tags(text: str) -> dict | None:
+    """Recover a tool call from XML-ish envelopes the model sometimes emits.
+
+    Observed in production: instead of the JSON envelope it was asked for, the
+    model replied with
+        <tool calls>
+          {"tool": "channel_history", "args": {...}}
+        </tool calls>
+    which we treated as a provider outage and answered with a degraded line.
+    The intent is unambiguous, so honour it.
+    """
+    if "<" not in text:
+        return None
+    for obj in _json_objects(text):
+        if isinstance(obj, dict) and ("tool" in obj or "reply" in obj):
+            return obj
+    return None
+
+
+def _json_objects(text: str):
+    r"""Yield every top-level JSON object embedded in arbitrary text.
+
+    Needed because the obvious regex (``\{.*?\}``) stops at the first closing
+    brace it sees — which, for a nested envelope like
+    ``{"tool": "x", "args": {"n": 5}}``, is the *inner* one. Scanning with a
+    depth counter is the only way to get the whole object back.
+    """
+    depth, start, in_str, esc = 0, None, False, False
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    try:
+                        yield json.loads(text[start:i + 1])
+                    except json.JSONDecodeError:
+                        pass
+                    start = None
+
+
+def parse_envelope(text: str) -> dict | None:
+    """Turn a model reply into a tool-loop envelope, tolerating fences and tags."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    cleaned = raw
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:]
+        cleaned = cleaned.strip()
+    for candidate in (cleaned, raw):
+        try:
+            obj = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        # only an envelope counts — a plain JSON blob with no tool/reply key is
+        # not something to act on, and returning it would silently blank a reply
+        if isinstance(obj, dict) and ("tool" in obj or "reply" in obj):
+            return obj
+    return _unwrap_tool_tags(cleaned) or _unwrap_tool_tags(raw)
+
+
 async def run_tool(bot, name: str, args: dict) -> str:
     name = (name or "").strip()
     try:
@@ -328,10 +411,18 @@ async def run_loop(bot, base_system: str, user_prompt, *,
     tool_calls = 0
     for hop in range(MAX_HOPS):
         try:
-            data = await ai.chat_for("reply", messages, json_out=True,
-                                     max_tokens=max_tokens, timeout=timeout)
+            raw = await ai.chat_for("reply", messages, json_out=False,
+                                    max_tokens=max_tokens, timeout=timeout)
         except AIError:
             raise
+        # parse here rather than in ai.chat_for: models occasionally wrap the
+        # envelope in tags or prose, and the intent is still obvious
+        data = parse_envelope(raw)
+        if data is None:
+            # not a tool call and not an envelope — treat it as the answer
+            text = (raw or "").strip()
+            log.info("tool loop got plain text, using it as the reply")
+            return {"reply": text, "actions": []}
         if "tool" in data and hop < MAX_HOPS - 1:
             tool_calls += 1
             result = await run_tool(bot, data.get("tool"), data.get("args") or {})
