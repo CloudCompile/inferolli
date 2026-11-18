@@ -1,0 +1,10 @@
+.env
+.env.*
+bot.log
+bot.log.*
+__pycache__/
+*.pyc
+.git/
+.venv/
+data/memory/stm.json.tmp
+discord-bot.service

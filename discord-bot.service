@@ -1,0 +1,16 @@
+[Unit]
+Description=Discord bot (Inferolli) — AI setup, automod, proactive
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=inferenceport
+WorkingDirectory=/home/inferenceport/discord-bot
+ExecStart=/home/inferenceport/discord-bot/.venv/bin/python /home/inferenceport/discord-bot/bot.py
+EnvironmentFile=/home/inferenceport/discord-bot/.env
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

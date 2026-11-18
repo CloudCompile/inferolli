@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+
+# secrets and runtime state — never commit
+.env
+.env.*
+!.env.example
+*.pem
+data/
+
+# the vendored opencode server binary (~247 MB); see README for how to fetch it
+opencode-bin
+
+# logs
+bot.log
+bot.log.*
+
+# local env
+.venv/
