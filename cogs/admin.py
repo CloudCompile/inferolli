@@ -18,9 +18,23 @@ from helpers import is_admin
 log = logging.getLogger("cogs.admin")
 
 
+def _is_admin(user) -> bool:
+    """Admin standing = Discord Administrator OR a configured admin role.
+
+    Goes through permissions.py so role-based admins (config.json
+    permissions.admin_role_ids) can configure the bot, not just Discord
+    administrators — otherwise the same person can moderate but not change
+    settings. Synchronous: no I/O is involved.
+    """
+    if user is None or not hasattr(user, "guild_permissions"):
+        return False          # DMs, webhook authors — no server standing
+    import permissions
+    return permissions.is_admin(user)
+
+
 def moderator_only():
     async def check(interaction: discord.Interaction) -> bool:
-        if isinstance(interaction.user, discord.Member) and is_admin(interaction.user):
+        if _is_admin(interaction.user):
             return True
         await interaction.response.send_message("Admins only.", ephemeral=True)
         return False
@@ -32,7 +46,7 @@ class ConfigGroup(app_commands.Group):
         super().__init__(name="config", description="Bot settings for this server")
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if isinstance(interaction.user, discord.Member) and is_admin(interaction.user):
+        if _is_admin(interaction.user):
             return True
         await interaction.response.send_message("You need **administrator** permissions to use this.", ephemeral=True)
         return False

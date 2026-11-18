@@ -8,6 +8,7 @@
   minutes or by an admin's /unlock
 """
 
+import asyncio
 import logging
 import time
 from collections import deque
@@ -18,6 +19,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import ai
+import permissions
 from ai import AIError
 import memory
 from config import get as get_cfg
@@ -36,6 +38,7 @@ class GuardCog(commands.Cog):
         self.bot = bot
         self.joins: deque = deque()          # (ts, user_id)
         self.locked_until: dict[int, float] = {}   # guild_id -> ts
+        self._auto_lift: dict[int, asyncio.Task] = {}  # guild_id -> release task
 
     # ---------- raid watch ----------
 
@@ -57,6 +60,11 @@ class GuardCog(commands.Cog):
 
     @app_commands.command(name="unlock", description="Lift a raid lockdown (admin)")
     async def unlock(self, interaction: discord.Interaction):
+        # lifting a lockdown is an admin action: without this check any member
+        # could reopen a server that was frozen because it was under attack
+        if reason := permissions.refusal(interaction.user, "guard.lockdown"):
+            return await interaction.response.send_message(
+                f"{reason} — ask an admin to lift it.", ephemeral=True)
         ok = await self.lift_lockdown(interaction.guild, by=interaction.user)
         await interaction.response.send_message(
             "🔓 lockdown lifted." if ok else "no lockdown active.", ephemeral=True)
@@ -110,15 +118,33 @@ class GuardCog(commands.Cog):
             except discord.Forbidden:
                 continue
         self.locked_until[guild.id] = time.time() + LOCKDOWN_MINUTES * 60
+        # the embed promises this, so actually schedule it — before this, a
+        # false-positive raid detection froze the server until a human noticed
+        task = asyncio.get_event_loop().create_task(self._auto_lift_task(guild, LOCKDOWN_MINUTES))
+        self._auto_lift[guild.id] = task
         e = discord.Embed(title="🔒 LOCKDOWN", colour=0xB00020,
                           description=f"raid suspected: {reason}\nchat frozen in {frozen} channels. "
                                       f"auto-lifts <t:{int(time.time()) + LOCKDOWN_MINUTES * 60}:R> "
                                       f"or with /unlock.")
         await send_mod_log(guild, await get_cfg(guild.id), e)
 
+    async def _auto_lift_task(self, guild: discord.Guild, minutes: float):
+        """Release the lockdown on a timer — the safety net for a false positive."""
+        try:
+            await asyncio.sleep(minutes * 60)
+        except asyncio.CancelledError:
+            return
+        finally:
+            self._auto_lift.pop(guild.id, None)
+        if await self.lift_lockdown(guild, by=None):
+            log.info("lockdown on %s auto-lifted after %.0f min", guild.id, minutes)
+
     async def lift_lockdown(self, guild: discord.Guild, by=None) -> bool:
         if not self.locked_until.pop(guild.id, None):
             return False
+        pending = self._auto_lift.pop(guild.id, None)
+        if pending and not pending.done():
+            pending.cancel()
         for ch in guild.text_channels:
             over = ch.overwrites_for(guild.default_role)
             if over.send_messages is False:

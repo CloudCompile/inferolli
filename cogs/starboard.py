@@ -18,9 +18,21 @@ STORE = Path(os.environ.get("BOT_DATA_DIR", Path(__file__).parent.parent / "data
 
 
 def _posted() -> set[int]:
-    if STORE.exists():
-        return set(json.loads(STORE.read_text()))
-    return set()
+    """Message ids already on the board.
+
+    A corrupt/partial store must not break the listener: this runs on every
+    reaction in the server, so raising here would silently disable the feature
+    until someone noticed. Worst case we repost one message, which is far
+    better than never posting at all.
+    """
+    if not STORE.exists():
+        return set()
+    try:
+        data = json.loads(STORE.read_text())
+        return {int(x) for x in data}
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        log.warning("starboard store unreadable — treating as empty")
+        return set()
 
 
 def _mark(message_id: int) -> None:

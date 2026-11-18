@@ -55,7 +55,7 @@ Rules baked into your character:
 # action type -> the action key used for the tier check (config.json
 # permissions.tier_actions). Server-structure changes default to admin; the
 # mapping keeps every action explicit so tiers can be loosened per server.
-_ACTION_KEYS = {
+ACTION_KEYS = {
     "create_channel": "channel.create",
     "create_category": "channel.create",
     "set_topic": "channel.topic",
@@ -110,7 +110,7 @@ async def _gate(action_type: str, action: dict, message: discord.Message) -> str
     if not hasattr(member, "guild_permissions"):  # DM/webhook authors can't hold powers
         return "only server members can do that"
 
-    key = _ACTION_KEYS.get(action_type)
+    key = ACTION_KEYS.get(action_type)
     if key is None:
         return f"unknown action {action_type}"
     return permissions.refusal(member, key)

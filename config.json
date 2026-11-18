@@ -76,7 +76,8 @@
       "desktop.shell": "admin",
       "computer.delegate": "admin",
       "member.ban": "staff",
-      "message.purge": "staff"
+      "message.purge": "staff",
+      "guard.lockdown": "admin"
     }
   },
   "log_level": "INFO"

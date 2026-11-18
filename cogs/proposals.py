@@ -16,6 +16,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import abilities
+import permissions
 from config import get as get_cfg
 
 log = logging.getLogger("cogs.proposals")
@@ -29,6 +30,7 @@ class ProposalsCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._open: dict[int, dict] = {}   # message_id -> {action, proposer, expires, title}
+        self._expiry: dict[int, asyncio.Task] = {}  # message_id -> expiry task
 
     # ---------- creation ----------
 
@@ -66,8 +68,15 @@ class ProposalsCog(commands.Cog):
             pass
         self._open[msg.id] = {"action": action, "proposer": proposer.id,
                               "expires": time.time() + PROPOSAL_TTL, "title": title}
-        asyncio.get_event_loop().create_task(self._expire_later(msg.id))
+        # hold the task so it can be cancelled on unload instead of leaking
+        task = asyncio.get_event_loop().create_task(self._expire_later(msg.id))
+        self._expiry[msg.id] = task
         return msg
+
+    async def cog_unload(self):
+        for task in self._expiry.values():
+            task.cancel()
+        self._expiry.clear()
 
     def _proposal_channel(self, guild: discord.Guild):
         # bot-commands is admin-only (fits the approver audience); fall back to system channel
@@ -75,7 +84,12 @@ class ProposalsCog(commands.Cog):
         return ch or guild.system_channel
 
     async def _expire_later(self, msg_id: int):
-        await asyncio.sleep(PROPOSAL_TTL)
+        try:
+            await asyncio.sleep(PROPOSAL_TTL)
+        except asyncio.CancelledError:
+            return
+        finally:
+            self._expiry.pop(msg_id, None)
         p = self._open.pop(msg_id, None)
         if p:  # expired un-voted
             log.info("proposal %s expired", msg_id)
@@ -93,10 +107,26 @@ class ProposalsCog(commands.Cog):
             self._open.pop(payload.message_id, None)
             return
         member = payload.member
-        if member.bot or not (member.guild_permissions.administrator
-                              or member.guild_permissions.manage_channels
-                              or member.guild_permissions.manage_roles):
-            return  # only the keys-holders decide
+        if member.bot:
+            return
+        # Two independent checks, both required:
+        #   1. the proposer can never approve their own proposal, and
+        #   2. the approver must hold the tier THIS action requires — a staff
+        #      member with manage_channels must not approve an admin-tier action
+        #      just because they can see the vote message.
+        if member.id == prop.get("proposer"):
+            log.info("proposal %s: proposer cannot approve their own proposal",
+                     payload.message_id)
+            return
+        action_key = abilities.ACTION_KEYS.get((prop["action"].get("type") or "").strip())
+        if action_key is None:
+            self._open.pop(payload.message_id, None)
+            return
+        if not permissions.allows(member, action_key):
+            log.info("proposal %s: %s lacks the %s tier for %s",
+                     payload.message_id, member.display_name,
+                     permissions.required_tier(action_key), action_key)
+            return
 
         channel = self.bot.get_channel(payload.channel_id)
         msg = await channel.fetch_message(payload.message_id)

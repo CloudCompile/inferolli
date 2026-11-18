@@ -133,13 +133,14 @@ async def oc_session(channel_id: int, title: str) -> str | None:
             sid = (r.json().get("data") or {}).get("id")
             _session_ids[channel_id] = sid
             try:
+                with open(state_file) as f:
+                    state = json.load(f)
+            except Exception:
                 state = {}
-                try:
-                    state = json.load(open(state_file))
-                except Exception:
-                    pass
-                state[str(channel_id)] = sid
-                json.dump(state, open(state_file, "w"), indent=1)
+            state[str(channel_id)] = sid
+            try:
+                with open(state_file, "w") as f:
+                    json.dump(state, f, indent=1)
             except Exception:
                 pass
             return sid

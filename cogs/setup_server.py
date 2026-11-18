@@ -13,6 +13,14 @@ from discord.ext import commands
 
 from helpers import is_admin
 
+
+def _is_admin(user) -> bool:
+    """Setup is admin-only; 'admin' includes configured admin roles."""
+    if user is None or not hasattr(user, "guild_permissions"):
+        return False          # DMs, webhook authors — no server standing
+    import permissions
+    return permissions.is_admin(user)
+
 log = logging.getLogger("cogs.setup")
 
 MUTED_ROLE_NAME = "Muted"
@@ -48,7 +56,8 @@ class SetupGroup(app_commands.Group):
         self.__original_description__ = self.description
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if isinstance(interaction.user, discord.Member) and is_admin(interaction.user):
+        import permissions
+        if isinstance(interaction.user, discord.Member) and permissions.is_admin(interaction.user):
             return True
         await interaction.response.send_message("You need **administrator** permissions to use this.", ephemeral=True)
         return False
