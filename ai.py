@@ -62,7 +62,14 @@ async def chat_for(job: str, messages: list[dict], *, json_out: bool = False, **
     try:
         obj = _json.loads(text)
     except _json.JSONDecodeError as e:
-        raise AIError(f"AI did not return valid JSON: {raw[:200]}") from e
+        # A reply cut off at the token limit is still largely usable: salvage
+        # the complete entries from the top-level array instead of losing the
+        # whole response (this silently emptied the channel-topic map).
+        salvaged = _salvage_truncated_json(text)
+        if salvaged is None:
+            raise AIError(f"AI did not return valid JSON: {raw[:200]}") from e
+        log.warning("AI JSON was truncated — salvaged %d key(s)", len(salvaged))
+        obj = salvaged
     if not isinstance(obj, dict):
         raise AIError("AI returned JSON that is not an object")
     return obj
@@ -74,6 +81,43 @@ DECISION_MODEL = str(settings.get("ai.decision_model", "microsoft/decision-1",
 
 class AIError(Exception):
     pass
+
+
+
+def _salvage_truncated_json(text: str) -> dict | None:
+    """Recover complete objects from a JSON document cut off mid-write.
+
+    Keeps the elements of the first top-level array that parse on their own, so
+    '{"channels": [{...}, {...}, {"id": "trunc' yields the two complete entries
+    rather than nothing at all.
+    """
+    import json as _json
+    import re as _re
+    start = text.find("[")
+    if start == -1:
+        return None
+    key_match = _re.search(r'"([A-Za-z0-9_]+)"\s*:\s*\[', text[:start + 1])
+    if not key_match:
+        return None
+    items, depth, buf = [], 0, []
+    for ch in text[start + 1:]:
+        if ch == "{":
+            depth += 1
+        if depth:
+            buf.append(ch)
+        if ch == "}":
+            depth -= 1
+            if depth == 0 and buf:
+                try:
+                    items.append(_json.loads("".join(buf)))
+                except _json.JSONDecodeError:
+                    pass
+                buf = []
+        if ch == "[" and depth == 0:
+            break
+    if not items:
+        return None
+    return {key_match.group(1): items}
 
 
 async def _post(path: str, payload: dict, *, timeout: float, retries: int = 2,
@@ -213,7 +257,14 @@ async def chat_json(messages: list[dict], **kwargs) -> dict:
     try:
         obj = _json.loads(text)
     except _json.JSONDecodeError as e:
-        raise AIError(f"AI did not return valid JSON: {raw[:200]}") from e
+        # A reply cut off at the token limit is still largely usable: salvage
+        # the complete entries from the top-level array instead of losing the
+        # whole response (this silently emptied the channel-topic map).
+        salvaged = _salvage_truncated_json(text)
+        if salvaged is None:
+            raise AIError(f"AI did not return valid JSON: {raw[:200]}") from e
+        log.warning("AI JSON was truncated — salvaged %d key(s)", len(salvaged))
+        obj = salvaged
     if not isinstance(obj, dict):
         raise AIError("AI returned JSON that is not an object")
     return obj

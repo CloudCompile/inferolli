@@ -200,7 +200,7 @@ class DreamsCog(commands.Cog):
             data = await asyncio.wait_for(
                 ai.chat_for("dream", [{"role": "system", "content": system},
                                       {"role": "user", "content": "\n\n".join(digest)[:4000]}],
-                            json_out=True, max_tokens=700, temperature=0.3, timeout=90.0),
+                            json_out=True, max_tokens=1600, temperature=0.3, timeout=90.0),
                 timeout=110.0)
         except Exception:
             log.exception("channel topics failed")
@@ -210,7 +210,7 @@ class DreamsCog(commands.Cog):
                        (items[-1].get("channel") or "")
                        for items in by_chan.values()}
         written = 0
-        for item in (data.get("channels") or [])[:20]:
+        for item in (data.get("channels") or [])[:12]:
             if not isinstance(item, dict):
                 continue
             key = str(item.get("id") or "").strip()
