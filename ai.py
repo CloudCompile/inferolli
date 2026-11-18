@@ -11,18 +11,21 @@ import os
 
 import httpx
 
+import settings
+
 log = logging.getLogger("ai")
 
+# Model routing comes from config.json (non-secret) with env overrides, so
+# changing a model no longer means editing a file full of credentials.
 API_KEY = os.environ.get("INFERENCEPORT_API_KEY", "")
-BASE_URL = os.environ.get("AI_BASE_URL", "https://api.inferenceport.ai/v1").rstrip("/")
-MODEL = os.environ.get("AI_MODEL", "gpt-6-luna")
-FALLBACK_MODELS = [m.strip() for m in os.environ.get("AI_FALLBACK_MODELS", "lightning").split(",") if m.strip()]
+BASE_URL = settings.ai_base_url()
+MODEL = settings.ai_model()
+FALLBACK_MODELS = settings.ai_fallbacks()
 
 # --- providers: chat can run on a second gateway (e.g. Vercel AI Gateway),
 #     while decision + embeddings stay on InferencePort ---
-GW_BASE = os.environ.get("AI_GATEWAY_BASE_URL", "").rstrip("/")
+GW_BASE, GW_MODEL = settings.gateway()
 GW_KEY = os.environ.get("AI_GATEWAY_KEY", "")
-GW_MODEL = os.environ.get("AI_GATEWAY_MODEL", "").strip()
 
 
 def _provider_for(model: str) -> tuple[str, str, str]:
@@ -33,8 +36,9 @@ def _provider_for(model: str) -> tuple[str, str, str]:
 
 
 def _job_model(job: str) -> str | None:
-    """Mixture-of-models: per-job model override (AI_JOB_<JOB> in env)."""
-    return os.environ.get(f"AI_JOB_{job.upper().replace('-', '_')}", "").strip() or None
+    """Mixture-of-models: per-job model override (ai.jobs.<job> in config.json,
+    or AI_JOB_<JOB> in env)."""
+    return settings.job_model(job)
 
 
 async def chat_for(job: str, messages: list[dict], *, json_out: bool = False, **kwargs) -> str:
@@ -62,8 +66,10 @@ async def chat_for(job: str, messages: list[dict], *, json_out: bool = False, **
     if not isinstance(obj, dict):
         raise AIError("AI returned JSON that is not an object")
     return obj
-EMBED_MODEL = os.environ.get("AI_EMBED_MODEL", "text-embedding-3-small")
-DECISION_MODEL = os.environ.get("AI_DECISION_MODEL", "microsoft/decision-1")
+EMBED_MODEL = str(settings.get("ai.embed_model", "text-embedding-3-small",
+                              env="AI_EMBED_MODEL"))
+DECISION_MODEL = str(settings.get("ai.decision_model", "microsoft/decision-1",
+                                 env="AI_DECISION_MODEL"))
 
 
 class AIError(Exception):

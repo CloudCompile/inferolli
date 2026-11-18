@@ -9,7 +9,13 @@ class FakePermissions:
         self.administrator = kw.get("administrator", False)
         self.send_messages = kw.get("send_messages", True)
         self.read_messages = kw.get("read_messages", True)
-        self.manage_roles = kw.get("manage_roles", True)
+        # a plain member does NOT hold these; tests that need them opt in
+        self.manage_roles = kw.get("manage_roles", False)
+        self.manage_messages = kw.get("manage_messages", False)
+        self.manage_channels = kw.get("manage_channels", False)
+        self.moderate_members = kw.get("moderate_members", False)
+        self.kick_members = kw.get("kick_members", False)
+        self.ban_members = kw.get("ban_members", False)
 
 
 def _not_found():

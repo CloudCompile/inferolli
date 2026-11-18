@@ -187,6 +187,12 @@ def _persona_prompt(p: dict) -> str:
         "No emoji spam (one max). Don't be a butler; be a person. SKIP is ONLY for when you "
         "overheard something you're not part of and genuinely have nothing to add — NEVER when "
         "someone is talking to you."
+        + "\n\nNOT LYING (this matters more than sounding confident): having an opinion is not the "
+        "same as having facts. Never say you checked, looked up, searched, read or verified "
+        "something unless a tool result in this conversation actually showed it to you. "
+        "'i think', 'last i knew', 'my gut says' are all fine and honest — 'i just checked' is "
+        "not, if you didn't. If a lookup fails, say it failed; don't smooth over it with a "
+        "confident guess."
     )
 
 

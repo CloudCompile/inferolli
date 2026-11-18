@@ -21,11 +21,40 @@ import httpx
 import ai
 from ai import AIError
 import memory
+import settings
 
 log = logging.getLogger("tools")
 
 TINYFISH_KEY = os.environ.get("TINYFISH_API_KEY", "").strip()
 MAX_HOPS = 3
+
+EVIDENCE_RULE = (
+    "\n\nEVIDENCE RULE — this one is absolute:\n"
+    "- Never claim you checked, looked up, searched, read, or verified something unless a "
+    "tool result in THIS conversation actually showed it to you.\n"
+    "- \"I think\", \"last I knew\", \"from memory\" are honest and fine. \"I checked\" is not, "
+    "if you didn't.\n"
+    "- If a lookup failed, say the lookup failed and name what blocked it. Don't paper over "
+    "a failed tool call with a confident answer.\n"
+    "- Absence of evidence is not evidence: not finding something doesn't prove it's untrue, "
+    "outdated, or broken.\n"
+    "- Before answering a question about current state (versions, prices, who said what, "
+    "what's deployed), prefer one real lookup over a remembered guess."
+)
+
+# phrases that imply verification — used only to log when the model asserts
+# something it didn't check (no behaviour change, just observability)
+_CLAIM_RX = re.compile(
+    r"\b(i (?:just |already )?(?:checked|looked|searched|read|verified|confirmed|pulled up)"
+    r"|i(?:'ve| have) (?:checked|looked|searched|verified|confirmed)"
+    r"|according to (?:the|my) (?:search|lookup|source)"
+    r"|i found (?:that |it |the ))\b", re.I)
+
+
+def claimed_without_evidence(reply: str, tool_calls: int) -> bool:
+    """True when a reply asserts verification but no tool ran this turn."""
+    return bool(reply) and tool_calls == 0 and bool(_CLAIM_RX.search(reply))
+
 
 TOOLS_PROMPT = """
 TOOLS (you can look things up before answering). Reply ONLY JSON, either:
@@ -175,7 +204,8 @@ async def run_tool(bot, name: str, args: dict) -> str:
         if name == "docs_search":
             return await docs_search(str(args.get("query", ""))[:300])
         if name == "computer":
-            if not os.environ.get("COMPUTER_TOOL_ENABLED", "1") == "1":
+            if not settings.get_bool("computer.tool_enabled", True,
+                                    env="COMPUTER_TOOL_ENABLED"):
                 return "(computer access disabled)"
             prompt = str(args.get("prompt", ""))[:500]
             import subprocess
@@ -201,10 +231,11 @@ async def run_loop(bot, base_system: str, user_prompt, *,
     admin: enables the computer tool (opencode delegation) for this loop.
     """
     sys_prompt = base_system + TOOLS_PROMPT.replace(
-        "{computer_line}", COMPUTER_TOOL if admin else "")
+        "{computer_line}", COMPUTER_TOOL if admin else "") + EVIDENCE_RULE
     messages = [{"role": "system", "content": sys_prompt},
                 {"role": "user", "content": user_prompt if content_payload is None
                  else content_payload}]
+    tool_calls = 0
     for hop in range(MAX_HOPS):
         try:
             data = await ai.chat_for("reply", messages, json_out=True,
@@ -212,6 +243,7 @@ async def run_loop(bot, base_system: str, user_prompt, *,
         except AIError:
             raise
         if "tool" in data and hop < MAX_HOPS - 1:
+            tool_calls += 1
             result = await run_tool(bot, data.get("tool"), data.get("args") or {})
             messages.append({"role": "assistant", "content": json.dumps(data)})
             messages.append({"role": "user", "content": f"tool result:\n{result[:1200]}\n\n"
@@ -220,5 +252,7 @@ async def run_loop(bot, base_system: str, user_prompt, *,
         # final answer
         reply = str(data.get("reply", "")).strip()
         actions = data.get("actions") or [] if allow_actions else []
+        if claimed_without_evidence(reply, tool_calls):
+            log.warning("reply claims verification without a tool call: %r", reply[:90])
         return {"reply": reply, "actions": actions}
     return {"reply": "", "actions": []}

@@ -6,3 +6,4 @@ davey>=0.1
 fastapi>=0.110
 uvicorn>=0.29
 websockets>=13          # uvicorn's WS transport — noVNC's /websockify needs it
+e2b>=2.0                # sandbox control: launcher, shepherd, keepalive

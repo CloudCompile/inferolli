@@ -37,12 +37,13 @@ import ai
 from ai import AIError
 import memory
 from config import get as get_cfg
+import settings
 
 log = logging.getLogger("cogs.ambient")
 
-EVERY_S = int(os.environ.get("AMBIENT_EVERY_S", 1500))        # evaluate every 25 min
+EVERY_S = settings.get_int("ambient.every_seconds", 900, env="AMBIENT_EVERY_S")
 QUIET_START, QUIET_END = 2, 8                                  # UTC hours it stays quiet
-DAILY_CAP = int(os.environ.get("AMBIENT_DAILY_CAP", 4))
+DAILY_CAP = settings.get_int("ambient.daily_cap", 24, env="AMBIENT_DAILY_CAP")
 CHANNEL_COOLDOWN_S = 3 * 3600
 GLOBAL_COOLDOWN_S = 45 * 60
 CONFIDENCE = 0.80
@@ -56,7 +57,8 @@ REACT_CONFIDENCE = 0.86
 # "im bored / anyone wanna talk" — an overheard invitation: if no human picks
 # it up within LONELY_WAIT_S, the bot may choose to step in (low bar — they
 # asked for company; but it can still choose not to)
-LONELY_WAIT_S = int(os.environ.get("LONELY_WAIT_S", 180))
+LONELY_WAIT_S = settings.get_int("ambient.lonely_wait_seconds", 180,
+                                 env="LONELY_WAIT_S")
 LONELY_CONFIDENCE = 0.60
 LONELY_PER_USER_COOLDOWN = 6 * 3600
 _INVITE_RE = re.compile(

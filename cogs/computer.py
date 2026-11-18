@@ -20,19 +20,21 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+import permissions
+import settings
 from helpers import is_admin
 
 log = logging.getLogger("cogs.computer")
 
 WORKSPACE = "/workspace"
-OC_TIMEOUT = int(os.environ.get("OC_TIMEOUT_S", 600))
+OC_TIMEOUT = settings.get_int("opencode.timeout_seconds", 200, env="OC_TIMEOUT_S")
 
 # ---------- opencode server client: persistent sessions, one thread per channel ----------
 
 import httpx as _httpx
 
 OC_URL = "http://localhost:4096"
-OC_PORT = int(os.environ.get("OPENCODE_PORT", 4096))
+OC_PORT = settings.get_int("opencode.port", 4096, env="OPENCODE_PORT")
 OC_AUTH = ("opencode", os.environ.get("OPENCODE_SERVER_PASSWORD", "inferolli-local-4096"))
 
 
@@ -292,12 +294,11 @@ class ComputerCog(commands.Cog):
             return await interaction.followup.send(
                 f"tunnel didn't come up: {(r.stderr or r.stdout)[:150]}")
 
-        # signed tokens: admins + staff get touch, everyone else watch-only
+        # signed tokens: anyone at staff tier or above gets touch, everyone else
+        # watch-only (role ids live in config.json, not in code)
         import desktop_gate
         uid = interaction.user.id
-        staff_role = interaction.guild.get_role(1565832623002091692)  # staff
-        is_staff = staff_role and staff_role in interaction.user.roles
-        rw = is_admin(interaction.user) or is_staff
+        rw = permissions.is_staff(interaction.user)
         touch = f"{url}/?token={desktop_gate.make_token(uid, rw=True)}"
         watch = f"{url}/?token={desktop_gate.make_token(uid, rw=False)}"
 

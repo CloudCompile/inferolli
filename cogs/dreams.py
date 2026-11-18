@@ -25,11 +25,12 @@ from ai import AIError
 import memory
 from config import get as get_cfg
 from config import update as update_cfg
+import settings
 
 log = logging.getLogger("cogs.dreams")
 
-DREAM_HOUR = int(os.environ.get("DREAM_HOUR", 3))
-DREAM_MINUTE = int(os.environ.get("DREAM_MINUTE", 14))
+DREAM_HOUR = settings.get_int("dreams.hour_utc", 3, env="DREAM_HOUR")
+DREAM_MINUTE = settings.get_int("dreams.minute", 14, env="DREAM_MINUTE")
 DREAMS_FILE = Path(__file__).parent.parent / "data" / "memory" / "dreams.json"
 
 

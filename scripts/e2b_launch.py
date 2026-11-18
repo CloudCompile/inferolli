@@ -23,39 +23,46 @@ if _env_path.exists():
             env[k.strip()] = v.strip().strip('"').strip("'")
 
 E2B_API_KEY = os.environ.get("E2B_API_KEY") or env.get("E2B_API_KEY") or ""
-assert E2B_API_KEY, "E2B_API_KEY missing"
-os.environ["E2B_API_KEY"] = E2B_API_KEY
+# NOTE: no assertion here. Importing this module must work without credentials
+# (CI, a fresh clone, anything that only wants the helpers); the check belongs
+# at the point of use, where a missing key actually matters.
+if E2B_API_KEY:
+    os.environ["E2B_API_KEY"] = E2B_API_KEY
 
 import e2b  # noqa: E402
 
 TEMPLATE = "inferolli"
 
-sandbox_envs = {
-    "DISCORD_BOT_TOKEN": env["DISCORD_BOT_TOKEN"],
-    "INFERENCEPORT_API_KEY": env["INFERENCEPORT_API_KEY"],
-    "AI_MODEL": env.get("AI_MODEL", "gpt-6-luna"),
-    "AI_FALLBACK_MODELS": env.get("AI_FALLBACK_MODELS", "gpt-5.6-luna,lightning"),
-    "BOT_LOG_LEVEL": "INFO",
-    # keep-alive: the bot resets its own running timeout
-    "E2B_API_KEY": E2B_API_KEY,
-    "E2B_KEEPALIVE": "1",
-    # S3 brain backup (InferencePort bucket storage)
-    "S3_ENDPOINT": env["S3_ENDPOINT"],
-    "S3_BUCKET": env["S3_BUCKET"],
-    "S3_ACCESS_KEY_ID": env["S3_ACCESS_KEY_ID"],
-    "S3_SECRET_ACCESS_KEY": env["S3_SECRET_ACCESS_KEY"],
-    # tonearm studio (the music sandbox)
-    "TONEARM_URL": env.get("TONEARM_URL", ""),
-    "TONEARM_API_KEY": env.get("TONEARM_API_KEY", ""),
-    # vercel ai gateway (primary chat provider)
-    "AI_GATEWAY_BASE_URL": env.get("AI_GATEWAY_BASE_URL", ""),
-    "AI_GATEWAY_KEY": env.get("AI_GATEWAY_KEY", ""),
-    "AI_GATEWAY_MODEL": env.get("AI_GATEWAY_MODEL", ""),
-    # the template id — the bot uses it to reincarnate itself at the 24h wall
-    "E2B_TEMPLATE_ID": "inferolli",
-    # mixture-of-models: per-job assignments
-    **{k: v for k, v in env.items() if k.startswith("AI_JOB_")},
-}
+def sandbox_envs() -> dict:
+    """Environment for the sandbox. Built on demand so importing this
+    module never requires credentials (CI, a fresh clone, helpers only)."""
+    missing = [k for k in ("DISCORD_BOT_TOKEN", "INFERENCEPORT_API_KEY",
+                           "E2B_API_KEY") if not (env.get(k) or os.environ.get(k))]
+    if missing:
+        raise SystemExit(f"missing required env for launch: {', '.join(missing)}")
+    return {
+        "DISCORD_BOT_TOKEN": env["DISCORD_BOT_TOKEN"],
+        "INFERENCEPORT_API_KEY": env["INFERENCEPORT_API_KEY"],
+        "BOT_LOG_LEVEL": "INFO",
+        # NOTE: model routing lives in config.json (committed), deliberately not
+        # injected here — an env var set at sandbox creation would outlive config
+        # edits and quietly pin an old model.
+        # keep-alive: the bot resets its own running timeout
+        "E2B_API_KEY": E2B_API_KEY,
+        "E2B_KEEPALIVE": "1",
+        # S3 brain backup (InferencePort bucket storage)
+        "S3_ENDPOINT": env["S3_ENDPOINT"],
+        "S3_BUCKET": env["S3_BUCKET"],
+        "S3_ACCESS_KEY_ID": env["S3_ACCESS_KEY_ID"],
+        "S3_SECRET_ACCESS_KEY": env["S3_SECRET_ACCESS_KEY"],
+        # tonearm studio (the music sandbox)
+        "TONEARM_URL": env.get("TONEARM_URL", ""),
+        "TONEARM_API_KEY": env.get("TONEARM_API_KEY", ""),
+        # vercel ai gateway (primary chat provider)
+        "AI_GATEWAY_KEY": env.get("AI_GATEWAY_KEY", ""),
+        # the template id — the bot uses it to reincarnate itself at the 24h wall
+        "E2B_TEMPLATE_ID": "inferolli",
+    }
 
 
 def log(msg: str):
@@ -111,7 +118,7 @@ def main():
     print("creating sandbox from template:", TEMPLATE)
     sbx = e2b.Sandbox.create(
         TEMPLATE,
-        envs=sandbox_envs,
+        envs=sandbox_envs(),
         timeout=60 * 60,  # 1h of running; keepalive pings every 15min to extend
         lifecycle={"on_timeout": "pause", "auto_resume": True},
     )

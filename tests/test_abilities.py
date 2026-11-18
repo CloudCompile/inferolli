@@ -66,14 +66,23 @@ class GateTests(unittest.TestCase):
         self.assertIsNone(self.run_async(abilities._gate("create_channel", {}, msg)))
 
     def test_specific_permission_allowed(self):
+        # a role management permission makes someone staff — but creating roles
+        # is an admin-tier action, so this is now refused (tiers are explicit)
         member = FakeMember(admin=False)
         member.guild_permissions.manage_roles = True
         msg = self._msg(member)
-        self.assertIsNone(self.run_async(abilities._gate("create_role", {}, msg)))
+        self.assertIn("admin", self.run_async(abilities._gate("create_role", {}, msg)))
+
+    def test_staff_tier_action_allowed_for_staff(self):
+        member = FakeMember(admin=False)
+        member.guild_permissions.moderate_members = True
+        msg = self._msg(member)
+        self.assertIsNone(self.run_async(abilities._gate("timeout_member", {}, msg)))
 
     def test_member_refused(self):
         msg = self._msg(FakeMember(admin=False))
-        self.assertIn("admin-only", self.run_async(abilities._gate("create_channel", {}, msg)))
+        reason = self.run_async(abilities._gate("create_channel", {}, msg))
+        self.assertIn("admin", reason)
 
     def test_unknown_action(self):
         msg = self._msg(FakeMember(admin=True))

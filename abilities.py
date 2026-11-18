@@ -12,6 +12,7 @@ from datetime import timedelta
 
 import discord
 
+import permissions
 from config import get as get_cfg
 
 log = logging.getLogger("cogs.abilities")
@@ -51,18 +52,20 @@ Rules baked into your character:
   something a person with keys just wouldn't do
 """
 
-# action type -> the permission the *requester* needs
-_PERMS = {
-    "create_channel": "manage_channels",
-    "create_category": "manage_channels",
-    "set_topic": "manage_channels",
-    "rename_channel": "manage_channels",
-    "delete_channel": "manage_channels",
-    "archive_channel": "manage_channels",
-    "pin_message": "manage_messages",
-    "create_role": "manage_roles",
-    "assign_role": "manage_roles",
-    "timeout_member": "moderate_members",
+# action type -> the action key used for the tier check (config.json
+# permissions.tier_actions). Server-structure changes default to admin; the
+# mapping keeps every action explicit so tiers can be loosened per server.
+_ACTION_KEYS = {
+    "create_channel": "channel.create",
+    "create_category": "channel.create",
+    "set_topic": "channel.topic",
+    "rename_channel": "channel.rename",
+    "delete_channel": "channel.delete",
+    "archive_channel": "channel.archive",
+    "pin_message": "message.pin",
+    "create_role": "role.create",
+    "assign_role": "role.assign",
+    "timeout_member": "member.timeout",
 }
 
 
@@ -99,18 +102,18 @@ def _resolve_channel(guild: discord.Guild, ref: str | None):
 
 
 async def _gate(action_type: str, action: dict, message: discord.Message) -> str | None:
-    """Return a refusal reason or None if allowed. Admin-only by design."""
+    """Return a refusal reason or None if allowed.
+
+    Each action declares its minimum tier in config.json, so this is a data
+    decision rather than a hardcoded permission check (see permissions.py)."""
     member = message.author
     if not hasattr(member, "guild_permissions"):  # DM/webhook authors can't hold powers
         return "only server members can do that"
 
-    needed = _PERMS.get(action_type)
-    if needed is None:
+    key = _ACTION_KEYS.get(action_type)
+    if key is None:
         return f"unknown action {action_type}"
-    perms = member.guild_permissions
-    if not (getattr(perms, needed, False) or perms.administrator):
-        return "server changes are admin-only — bug someone with the keys"
-    return None
+    return permissions.refusal(member, key)
 
 
 async def _modlog(guild: discord.Guild, title: str, description: str):

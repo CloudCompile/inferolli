@@ -17,10 +17,11 @@ import time
 from discord.ext import commands
 
 import memory
+import settings
 
 log = logging.getLogger("cogs.serverpulse")
 
-EVERY_S = int(os.environ.get("PULSE_EVERY_S", 180))
+EVERY_S = settings.get_int("serverpulse.every_seconds", 60, env="PULSE_EVERY_S")
 MSG_PER_CHANNEL = 3
 MAX_CHANNELS = 10
 DIGEST_CAP = 1800

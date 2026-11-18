@@ -23,11 +23,13 @@ import ai
 from ai import AIError
 import memory
 from config import get as get_cfg
+import settings
 
 log = logging.getLogger("cogs.thoughts")
 
-WATCH = [s.strip() for s in os.environ.get("THOUGHT_CHANNELS", "general-chat,casual").split(",")]
-EVERY_S = int(os.environ.get("THOUGHT_EVERY_S", 1800))  # every 30 min
+WATCH = settings.get_list("thoughts.channels", ["general-chat", "casual"],
+                          env="THOUGHT_CHANNELS")
+EVERY_S = settings.get_int("thoughts.every_seconds", 1800, env="THOUGHT_EVERY_S")
 QUIET_START, QUIET_END = 2, 8                            # UTC hours it stays quiet
 MIN_NEW_MESSAGES = 3
 STATE_FILE = Path(__file__).resolve().parent.parent / "data" / "memory" / "thoughts-state.json"

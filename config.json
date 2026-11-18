@@ -1,0 +1,79 @@
+{
+  "_comment": "Non-secret runtime configuration. Secrets (tokens, API keys) live in .env and are never read from this file. Edit here for model/routing/timing changes; an env var of the same name still overrides for one-off runs.",
+  "ai": {
+    "base_url": "https://api.inferenceport.ai/v1",
+    "model": "deepseek-v4.1-flash-1017",
+    "fallback_models": [
+      "gpt-6-luna",
+      "gpt-5.6-luna",
+      "lightning"
+    ],
+    "embed_model": "text-embedding-3-small",
+    "decision_model": "microsoft/decision-1",
+    "jobs": {
+      "dream": "gemini-4-hydrogen",
+      "soul": "gemini-4-hydrogen",
+      "reflect": "gpt-5.6-luna",
+      "rag": "gpt-5.6-luna"
+    },
+    "gateway": {
+      "_comment": "Optional second provider for chat. Its key stays in .env.",
+      "base_url": "",
+      "model": ""
+    }
+  },
+  "tonearm": {
+    "url": ""
+  },
+  "thoughts": {
+    "channels": [
+      "general-chat",
+      "casual"
+    ],
+    "every_seconds": 1800
+  },
+  "ambient": {
+    "every_seconds": 1500,
+    "daily_cap": 4,
+    "lonely_wait_seconds": 180
+  },
+  "dreams": {
+    "hour_utc": 3,
+    "minute": 14
+  },
+  "serverpulse": {
+    "every_seconds": 180
+  },
+  "opencode": {
+    "port": 4096,
+    "timeout_seconds": 600
+  },
+  "computer": {
+    "tool_enabled": true
+  },
+  "permissions": {
+    "_comment": "Role ids that grant each tier. Discord permissions are also honoured (Administrator = admin, Moderate Members/Manage Messages = staff). Actions map to the minimum tier required.",
+    "admin_role_ids": [],
+    "staff_role_ids": [],
+    "tier_actions": {
+      "channel.create": "admin",
+      "channel.rename": "admin",
+      "channel.delete": "admin",
+      "channel.topic": "admin",
+      "channel.archive": "admin",
+      "role.create": "admin",
+      "role.assign": "admin",
+      "member.timeout": "staff",
+      "member.warn": "staff",
+      "member.kick": "staff",
+      "member.mute": "staff",
+      "message.pin": "staff",
+      "desktop.touch": "staff",
+      "desktop.shell": "admin",
+      "computer.delegate": "admin",
+      "member.ban": "staff",
+      "message.purge": "staff"
+    }
+  },
+  "log_level": "INFO"
+}

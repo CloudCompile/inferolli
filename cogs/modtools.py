@@ -19,6 +19,7 @@ from discord.ext import commands
 
 import ai
 from ai import AIError
+import permissions
 from helpers import is_admin, send_mod_log
 
 log = logging.getLogger("cogs.modtools")
@@ -63,10 +64,15 @@ def _target(guild: discord.Guild, who: str) -> discord.Member | None:
     return cand[0] if len(cand) == 1 else None
 
 
+def _staff_gate(interaction: discord.Interaction, action: str) -> str | None:
+    """Tier check for a moderation command (defaults to staff)."""
+    return permissions.refusal(interaction.user, action)
+
+
 def _can_touch(interaction: discord.Interaction, member: discord.Member) -> str | None:
     if member.bot:
         return "that's a bot"
-    if is_admin(member):
+    if permissions.is_admin(member):
         return "they're an admin — this bot doesn't touch admins"
     if member.top_role >= interaction.user.top_role and interaction.user.id != interaction.guild.owner_id:
         return "they're above or level with you in the role ladder"
@@ -85,6 +91,8 @@ class ModToolsCog(commands.Cog):
 
     @app_commands.command(name="warn", description="Warn a member (recorded, counts toward escalation)")
     async def warn(self, interaction: discord.Interaction, member: discord.Member, reason: str):
+        if bad := _staff_gate(interaction, "member.warn"):
+            return await self._ack(interaction, bad)
         if bad := _can_touch(interaction, member):
             return await self._ack(interaction, bad)
         record_case(interaction.guild_id, member.id, "warn", reason, interaction.user.display_name)
@@ -102,6 +110,8 @@ class ModToolsCog(commands.Cog):
     @app_commands.command(name="mute", description="Timeout a member")
     async def mute(self, interaction: discord.Interaction, member: discord.Member,
                    minutes: app_commands.Range[int, 1, 40320], reason: str = "no reason given"):
+        if bad := _staff_gate(interaction, "member.mute"):
+            return await self._ack(interaction, bad)
         if bad := _can_touch(interaction, member):
             return await self._ack(interaction, bad)
         await member.timeout(discord.utils.utcnow() + timedelta(minutes=minutes),
@@ -115,12 +125,16 @@ class ModToolsCog(commands.Cog):
 
     @app_commands.command(name="unmute", description="Remove a timeout")
     async def unmute(self, interaction: discord.Interaction, member: discord.Member):
+        if bad := _staff_gate(interaction, "member.mute"):
+            return await self._ack(interaction, bad)
         await member.timeout(None)
         record_case(interaction.guild_id, member.id, "unmute", "", interaction.user.display_name)
         await self._ack(interaction, f"unmuted {member.display_name}.")
 
     @app_commands.command(name="kick", description="Kick a member")
     async def kick(self, interaction: discord.Interaction, member: discord.Member, reason: str):
+        if bad := _staff_gate(interaction, "member.kick"):
+            return await self._ack(interaction, bad)
         if bad := _can_touch(interaction, member):
             return await self._ack(interaction, bad)
         await member.kick(reason=f"by {interaction.user}: {reason}")
@@ -133,6 +147,8 @@ class ModToolsCog(commands.Cog):
     @app_commands.command(name="ban", description="Ban a member")
     async def ban(self, interaction: discord.Interaction, member: discord.Member, reason: str,
                   delete_days: app_commands.Range[int, 0, 7] = 1):
+        if bad := _staff_gate(interaction, "member.ban"):
+            return await self._ack(interaction, bad)
         if bad := _can_touch(interaction, member):
             return await self._ack(interaction, bad)
         await member.ban(delete_message_days=delete_days,
@@ -148,6 +164,8 @@ class ModToolsCog(commands.Cog):
     async def purge(self, interaction: discord.Interaction,
                     count: app_commands.Range[int, 1, 100],
                     member: discord.Member | None = None):
+        if bad := _staff_gate(interaction, "message.purge"):
+            return await self._ack(interaction, bad)
         ch = interaction.channel
         deleted = 0
         ids = []

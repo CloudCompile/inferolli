@@ -13,6 +13,7 @@ import discord
 from discord.ext import commands
 
 from config import DEFAULTS
+import settings
 
 # load .env from the project dir if present (KEY=value lines).
 # .env WINS over the ambient environment: the launcher writes /bot/.env and the
@@ -29,7 +30,7 @@ if _env_file.exists():
                 os.environ[_k.strip()] = _v
 
 logging.basicConfig(
-    level=os.environ.get("BOT_LOG_LEVEL", "INFO"),
+    level=settings.log_level(),
     format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
 )
 log = logging.getLogger("bot")
@@ -116,10 +117,10 @@ async def main() -> None:
 
     token = os.environ["DISCORD_BOT_TOKEN"]
 
-    # model routing at a glance — this is how you confirm .env actually won
-    log.info("model routing: chat=%s fallbacks=%s",
-             os.environ.get("AI_MODEL", "gpt-6-luna"),
-             os.environ.get("AI_FALLBACK_MODELS", "lightning"))
+    # model routing at a glance — this is how you confirm config.json won
+    log.info("model routing: chat=%s fallbacks=%s (source: %s)",
+             settings.ai_model(), settings.ai_fallbacks(),
+             settings.CONFIG_PATH.name)
 
     bot = make_bot()
 

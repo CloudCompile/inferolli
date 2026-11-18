@@ -1,0 +1,74 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run the hermetic test suite
+        # the suite is deliberately offline: no Discord, no E2B, no provider
+        # calls. If a test needs the network it belongs in a separate job.
+        run: python -m unittest discover -s tests -v 2>&1 | tail -40
+
+  secrets:
+    # config.json is committed; .env is not. Catch an accidental credential
+    # landing in tracked source before it reaches main.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan tracked files for credentials
+        run: |
+          set -e
+          if grep -rInE '(sk-[A-Za-z0-9]{20,}|ipa_live[A-Za-z0-9]{8,}|e2b_[a-f0-9]{24,}|gho_[A-Za-z0-9]{20,}|AKIA[A-Z0-9]{12,})' \
+               --include='*.py' --include='*.json' --include='*.md' --include='*.sh' \
+               --exclude-dir=.git . ; then
+            echo "::error::possible credential in a tracked file"
+            exit 1
+          fi
+          echo "no credentials found"
+
+      - name: Assert secrets are not tracked
+        run: |
+          set -e
+          for f in .env data opencode-bin; do
+            if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+              echo "::error::$f must not be committed"
+              exit 1
+            fi
+          done
+          echo "secrets and runtime state are untracked"
+
+  config:
+    # config.json is the single source for non-secret settings: it must parse
+    # and every action must declare a valid permission tier.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate config.json
+        run: python -m unittest tests.test_settings tests.test_permissions -v
