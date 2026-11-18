@@ -42,9 +42,12 @@ jobs:
       - name: Scan tracked files for credentials
         run: |
           set -e
+          # the workflow file and the guard test contain the patterns by design
           if grep -rInE '(sk-[A-Za-z0-9]{20,}|ipa_live[A-Za-z0-9]{8,}|e2b_[a-f0-9]{24,}|gho_[A-Za-z0-9]{20,}|AKIA[A-Z0-9]{12,})' \
                --include='*.py' --include='*.json' --include='*.md' --include='*.sh' \
-               --exclude-dir=.git . ; then
+               --exclude-dir=.git \
+               --exclude='tests.yml' \
+               --exclude='test_settings.py' . ; then
             echo "::error::possible credential in a tracked file"
             exit 1
           fi
