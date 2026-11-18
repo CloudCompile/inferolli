@@ -16,6 +16,7 @@ class FakePermissions:
         self.moderate_members = kw.get("moderate_members", False)
         self.kick_members = kw.get("kick_members", False)
         self.ban_members = kw.get("ban_members", False)
+        self.read_message_history = kw.get("read_message_history", True)
 
 
 def _not_found():

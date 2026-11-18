@@ -65,6 +65,7 @@ Available tools:
   {"tool": "web_search", "args": {"query": "..."}}          — search the web
   {"tool": "fetch_page", "args": {"url": "https://..."}}    — read a web page
   {"tool": "channel_history", "args": {"channel": "#name", "n": 10}} — recent messages from any channel
+  {"tool": "discord_search", "args": {"query": "words", "channel": "#optional", "author": "optional", "n": 10}} — search the server's ENTIRE history (reaches back further than your own memory; use it for "what did we say about X a while ago")
   {"tool": "member_profile", "args": {"name": "someone"}}   — everything you know about a member
   {computer_line}
 Use them when the answer isn't already in what you know: current events, prices,
@@ -163,6 +164,90 @@ def discord_find_channel(guild, name: str):
     return ch
 
 
+async def discord_search(bot, query: str, channel: str | None = None,
+                         author: str | None = None, n: int = 10) -> str:
+    """Search the guild's FULL message history via Discord's own search index.
+
+    This is the long-reach equivalent of channel_history: Discord indexes every
+    message the bot can read, so this reaches back years without us storing
+    anything. Bounded on purpose — a handful of results, visible-channel only —
+    because unbounded historical recall is exactly how a reply ends up citing a
+    conversation from another room nobody asked about.
+    """
+    import httpx
+    token = os.environ.get("DISCORD_BOT_TOKEN", "")
+    if not token:
+        return "(no Discord token available for search)"
+
+    guild = bot.guilds[0] if bot.guilds else None
+    if guild is None:
+        return "(no guild)"
+
+    # only channels the bot can actually read — never widen visibility
+    me = guild.me
+    visible = {c.id: c.name for c in guild.text_channels
+               if c.permissions_for(me).read_message_history}
+    if not visible:
+        return "(no readable channels)"
+
+    params = {"content": (query or "").strip()[:300], "limit": max(1, min(int(n), 25)),
+              "include_nsfw": "false", "sort_by": "timestamp", "sort_order": "desc"}
+    if channel:
+        ch = discord_find_channel(guild, channel)
+        if ch is not None and ch.id in visible:
+            params["channel_id"] = str(ch.id)
+        elif ch is not None:
+            return f"(can't read #{ch.name})"
+    if author:
+        member = discord.utils.find(
+            lambda m: m.display_name.lower() == author.lower().lstrip("@")
+            or m.name.lower() == author.lower().lstrip("@"), guild.members)
+        if member is not None:
+            params["author_id"] = str(member.id)
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as c:
+            r = await c.get(f"https://discord.com/api/v10/guilds/{guild.id}/messages/search",
+                            params=params,
+                            headers={"Authorization": f"Bot {token}"})
+    except Exception as e:
+        return f"(search failed: {str(e)[:80]})"
+
+    if r.status_code == 403:
+        return "(Discord refused the search — the bot needs access to the channels)"
+    if r.status_code != 200:
+        return f"(search failed: HTTP {r.status_code})"
+
+    data = r.json()
+    groups = data.get("messages") or []
+    hits = []
+    for group in groups:
+        for m in group if isinstance(group, list) else [group]:
+            cid = m.get("channel_id")
+            if isinstance(cid, str) and cid.isdigit():
+                cid = int(cid)
+            if cid not in visible:          # belt and braces: never leak a channel
+                continue
+            content = (m.get("content") or "").strip()
+            if not content:
+                continue
+            hits.append((m.get("timestamp", "")[:16], visible.get(cid, "?"),
+                         (m.get("author") or {}).get("username", "?"), content[:200]))
+            if len(hits) >= params["limit"]:
+                break
+        if len(hits) >= params["limit"]:
+            break
+
+    if not hits:
+        return "(nothing found for that search)"
+    lines = [f"- {ts} #{chan} {who}: {text}" for ts, chan, who, text in hits]
+    total = data.get("total_results")
+    head = f"discord search for {query!r}"
+    if total:
+        head += f" ({total} matches on record, showing {len(hits)})"
+    return head + ":\n" + "\n".join(lines)
+
+
 async def member_profile(bot, name: str) -> str:
     entries = await memory.stm_window(hours=24 * 7)
     theirs = [e for e in entries if name.lower() in e["name"].lower()]
@@ -199,6 +284,11 @@ async def run_tool(bot, name: str, args: dict) -> str:
             return await fetch_page(str(args.get("url", ""))[:500])
         if name == "channel_history":
             return await channel_history(bot, str(args.get("channel", "")), int(args.get("n", 10) or 10))
+        if name == "discord_search":
+            return await discord_search(bot, str(args.get("query", ""))[:300],
+                                        channel=args.get("channel") or None,
+                                        author=args.get("author") or None,
+                                        n=int(args.get("n", 10) or 10))
         if name == "member_profile":
             return await member_profile(bot, str(args.get("name", ""))[:60])
         if name == "docs_search":
