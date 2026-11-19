@@ -27,7 +27,8 @@ CHECK_EVERY_S = 15 * 60
 
 
 def log(msg: str):
-    print(f"[shepherd {datetime.utcnow().strftime('%m/%d %H:%M')}] {msg}", flush=True)
+    stamp = datetime.now(timezone.utc).strftime('%m/%d %H:%M')
+    print(f"[shepherd {stamp}] {msg}", flush=True)
 
 
 def env():
