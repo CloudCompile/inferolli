@@ -133,7 +133,7 @@ def main():
     # a file it can read to know which sandbox to extend.
     for _ in range(20):
         try:
-            sbx.files.write("/bot/data/sandbox-id", sbx.sandbox_id)
+            sbx.files.write("/bot/.e2b-sandbox-id", sbx.sandbox_id)
             break
         except Exception:
             time.sleep(1)

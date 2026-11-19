@@ -46,6 +46,13 @@ class SandboxIdTests(unittest.TestCase):
             self.assertEqual(ka.sandbox_id_from_files((str(bad), str(good))),
                              "iwyqqak4f6k8do5l3gft4")
 
+    def test_id_file_is_not_inside_the_backed_up_data_dir(self):
+        """data/ is tarred to S3 and restored into the NEXT sandbox — an id kept
+        there would be inherited, and a successor would extend a dead sandbox's
+        timeout while its own expired."""
+        self.assertFalse(any(p.startswith("/bot/data/") for p in ka.ID_FILES))
+        self.assertIn("/bot/.e2b-sandbox-id", ka.ID_FILES)
+
     def test_missing_files_are_not_an_error(self):
         self.assertIsNone(ka.sandbox_id_from_files(("/nonexistent/x",)))
 
@@ -285,7 +292,8 @@ class StartScriptTests(unittest.TestCase):
         self.assertIn("export E2B_KEEPALIVE=1", self.text)
 
     def test_falls_back_to_the_sandbox_id_file(self):
-        self.assertIn("/bot/data/sandbox-id", self.text)
+        self.assertIn("/bot/.e2b-sandbox-id", self.text)
+        self.assertNotIn("/bot/data/sandbox-id", self.text)
 
     def test_extends_its_own_window_before_the_bot_boots(self):
         self.assertIn("/timeout", self.text)

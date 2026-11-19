@@ -37,6 +37,19 @@ class StartShTests(unittest.TestCase):
     def test_only_idles_without_any_credentials(self):
         self.assertIn('if [ ! -s /bot/.env ]', self.text)
 
+    def test_bootstrap_is_not_behind_a_long_wait(self):
+        """The first attempt must happen BEFORE the wait loop.
+
+        A reincarnated sandbox boots with credentials in the environment but no
+        .env file. When the rebuild sat after the wait, it sat behind a ten
+        minute sleep — so the successor never started, and a drill that waited
+        four minutes saw nothing at all.
+        """
+        first_bootstrap = self.text.index("rebuild_env_from_environment\nfi")
+        wait_loop = self.text.index("while [ ! -f /bot/.env ]")
+        self.assertLess(first_bootstrap, wait_loop)
+        self.assertNotIn("WAITED\" -lt 600", self.text)
+
     def test_restores_backup_before_booting(self):
         restore = self.text.index("restore_latest")
         boot = self.text.index("python -u bot.py")

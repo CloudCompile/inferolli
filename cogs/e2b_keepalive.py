@@ -17,7 +17,7 @@ default), the bot could not boot and ping in 5 minutes, and it paused again.
 From the outside: "inferolli keeps stopping."
 
 Now it decides for itself, from sources that cannot silently be empty:
-    id  → E2B_SANDBOX_ID → /bot/data/sandbox-id → /bot/data/e2b_sandbox_id
+    id  → E2B_SANDBOX_ID → /bot/.e2b-sandbox-id → E2B API (metadata mark)
     key → E2B_API_KEY env → parsed out of /bot/.env
 and if it still can't, it says exactly what is missing instead of skipping.
 
@@ -44,7 +44,11 @@ PING_EVERY = int(os.environ.get("E2B_PING_EVERY_S", 120))  # well inside a 5-min
 LIFETIME_H = 23.0          # reincarnate an hour before the 24h wall
 TIMEOUT_S = 3600           # the window we ask for on every ping
 
-ID_FILES = ("/bot/data/sandbox-id", "/bot/data/e2b_sandbox_id")
+# NOT under /bot/data: that directory is tarred to S3 and restored into the
+# NEXT sandbox, so an id stored there would be inherited by a successor and it
+# would happily extend a dead sandbox's timeout while it expired itself.
+ID_FILE = "/bot/.e2b-sandbox-id"
+ID_FILES = (ID_FILE,)
 _sleep = asyncio.sleep          # indirection so tests can run the loop without waiting
 ENV_FILE = "/bot/.env"
 
@@ -243,8 +247,7 @@ class KeepAliveCog(commands.Cog):
             if sandbox_id:
                 # remember it: start.sh and the next boot look here first
                 try:
-                    os.makedirs("/bot/data", exist_ok=True)
-                    with open("/bot/data/sandbox-id", "w") as f:
+                    with open(ID_FILE, "w") as f:
                         f.write(sandbox_id)
                 except OSError:
                     pass

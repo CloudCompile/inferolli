@@ -4,16 +4,9 @@
 set -u
 cd /bot
 
-# --- wait for the secrets (the launcher writes /bot/.env right after create;
-#     dashboard-started sandboxes never get one and idle out below) ---
-WAITED=0
-while [ ! -f /bot/.env ] && [ "$WAITED" -lt 600 ]; do
-  sleep 5
-  WAITED=$((WAITED + 5))
-done
-if [ ! -f /bot/.env ]; then
+rebuild_env_from_environment() {
   # A sandbox created by a PREDECESSOR (the 24h reincarnation path) has no
-  # launcher to write this file, and the canonical copy lives in S3 — which we
+  # launcher to write /bot/.env, and the canonical copy lives in S3 — which we
   # cannot reach without credentials. Chicken and egg. Creation envs DO reach
   # the start command, so rebuild .env from them; the S3 restore below then
   # replaces it with the real one.
@@ -25,7 +18,24 @@ if [ ! -f /bot/.env ]; then
     v="$(printenv "$k" 2>/dev/null || true)"
     [ -n "$v" ] && printf '%s=%s\n' "$k" "$v" >> /bot/.env
   done
+}
+
+# --- if we booted with credentials but no file, use them NOW. Waiting ten
+#     minutes for a launcher that does not exist was a real outage: the
+#     reincarnated sandbox never started at all. ---
+if [ ! -f /bot/.env ] && printenv DISCORD_BOT_TOKEN >/dev/null 2>&1; then
+  rebuild_env_from_environment
 fi
+
+# --- otherwise wait for the launcher (it writes /bot/.env right after create;
+#     dashboard-started sandboxes never get one and idle out below) ---
+WAITED=0
+while [ ! -f /bot/.env ] && [ "$WAITED" -lt 120 ]; do
+  sleep 5
+  WAITED=$((WAITED + 5))
+done
+[ -f /bot/.env ] || rebuild_env_from_environment
+
 if [ ! -s /bot/.env ]; then
   echo "[start] no .env and no credentials in the environment — idling"
   exec sleep infinity
@@ -69,9 +79,12 @@ done
 # extend it, and from the outside that looks like the bot randomly stopping.
 export E2B_KEEPALIVE=1
 if [ -z "${E2B_SANDBOX_ID:-}" ] || [ "${E2B_SANDBOX_ID}" = "e2b.local" ]; then
-  if [ -s /bot/data/sandbox-id ]; then
-    export E2B_SANDBOX_ID="$(cat /bot/data/sandbox-id)"
+  if [ -s /bot/.e2b-sandbox-id ]; then
+    export E2B_SANDBOX_ID="$(cat /bot/.e2b-sandbox-id)"
   fi
+else
+  # remember it: the bot's keepalive and opencode both read this file
+  printf '%s' "$E2B_SANDBOX_ID" > /bot/.e2b-sandbox-id
 fi
 if [ -n "${E2B_SANDBOX_ID:-}" ] && [ -n "${E2B_API_KEY:-}" ]; then
   python3 - <<'EOPY' >> /bot/bot.log 2>&1
