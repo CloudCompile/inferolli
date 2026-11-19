@@ -4,6 +4,13 @@
 set -u
 cd /bot
 
+# Every stage logs here. Before this, the boot was invisible: start.sh wrote to
+# the start command's stdout, which nothing captures, so a sandbox that never
+# booted the bot looked exactly like one that was still starting.
+SLOG=/bot/bot.log
+slog() { echo "[start $(date -u +%H:%M:%S)] $*" >> "$SLOG"; }
+slog "start.sh up: .env=$([ -f /bot/.env ] && echo present || echo absent), env vars=$(env | wc -l)"
+
 rebuild_env_from_environment() {
   # A sandbox created by a PREDECESSOR (the 24h reincarnation path) has no
   # launcher to write /bot/.env, and the canonical copy lives in S3 — which we
@@ -26,6 +33,7 @@ rebuild_env_from_environment() {
 if [ ! -f /bot/.env ] && printenv DISCORD_BOT_TOKEN >/dev/null 2>&1; then
   rebuild_env_from_environment
 fi
+slog "after bootstrap: .env=$(wc -c < /bot/.env 2>/dev/null || echo 0) bytes"
 
 # --- otherwise wait for the launcher (it writes /bot/.env right after create;
 #     dashboard-started sandboxes never get one and idle out below) ---
@@ -45,9 +53,10 @@ set -a; . /bot/.env; set +a
 # --- restore the brain + the canonical .env from S3, BEFORE anything needs the
 #     real secrets (a reincarnated sandbox bootstraps a minimal .env above and
 #     only gets DISCORD_BOT_TOKEN / provider keys from this restore) ---
-echo "[start] restoring brain backup..."
+slog "restoring brain from s3..."
 python -c "from cogs.backup import restore_latest; print('[start]', restore_latest())" 2>&1 | tail -1
 set -a; . /bot/.env; set +a
+slog "brain restored: .env=$(wc -c < /bot/.env 2>/dev/null || echo 0) bytes"
 
 # --- the desktop display: Xvfb on :99, XFCE4 riding on it ---
 Xvfb :99 -screen 0 1440x900x24 -nolisten tcp > /dev/null 2>&1 &
@@ -68,6 +77,7 @@ set -a; . /bot/.env; set +a
 # every request 401s and the primary reply engine dies quietly.
 unset OPENCODE_SERVER_PASSWORD
 (nohup opencode serve --port 4096 > /tmp/opencode-serve.log 2>&1 &)
+slog "opencode serve launched"
 for _ in $(seq 1 20); do
   grep -q 'server password' /tmp/opencode-serve.log 2>/dev/null && break
   sleep 0.5
@@ -101,7 +111,7 @@ except Exception as e:
     print(f"[start] e2b window extension FAILED: {e}")
 EOPY
 else
-  echo "[start] no sandbox id or API key — cannot extend the e2b window" >> /bot/bot.log
+  slog "no sandbox id or API key — cannot extend the e2b window"
 fi
 
 # --- the stack watchdog: any dead piece gets revived (children of the start
@@ -122,6 +132,7 @@ fi
 done > /dev/null 2>&1 &)
 
 # --- run the bot under a supervisor loop (logs to /bot/bot.log) ---
+slog "handing over to the supervisor"
 while true; do
   echo "=== [supervisor] starting bot $(date)" >> /bot/bot.log
   python -u bot.py >> /bot/bot.log 2>&1
