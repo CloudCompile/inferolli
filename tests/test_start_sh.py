@@ -22,8 +22,20 @@ class StartShTests(unittest.TestCase):
 
     def test_waits_for_env_then_idles(self):
         self.assertIn("while [ ! -f /bot/.env ]", self.text)
-        self.assertIn("no .env after 10 min", self.text)
         self.assertIn("exec sleep infinity", self.text)
+
+    def test_bootstraps_env_from_the_environment(self):
+        """A reincarnated sandbox has no launcher to write /bot/.env, and the
+        canonical copy is in S3 — unreachable without credentials. Before this,
+        such a sandbox idled for 10 minutes and never started the bot at all."""
+        idle = self.text.index("exec sleep infinity")
+        bootstrap = self.text.index("rebuilding it from the environment")
+        self.assertLess(bootstrap, idle)
+        for key in ("DISCORD_BOT_TOKEN", "S3_ENDPOINT", "E2B_API_KEY"):
+            self.assertIn(key, self.text)
+
+    def test_only_idles_without_any_credentials(self):
+        self.assertIn('if [ ! -s /bot/.env ]', self.text)
 
     def test_restores_backup_before_booting(self):
         restore = self.text.index("restore_latest")

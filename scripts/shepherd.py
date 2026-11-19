@@ -126,6 +126,34 @@ def paused_inferolli() -> list[str]:
         return []
 
 
+def extend_window(sandbox_id: str, seconds: int = 3600) -> bool:
+    """Reset a sandbox's runtime timeout via REST.
+
+    `e2b sandbox resume` grants 5 minutes and the CLI has no flag to change it.
+    Five minutes is less than a cold boot, so a resumed sandbox paused again
+    before the bot could extend itself — the resume looked successful and the
+    bot still went away. Always extend immediately after resuming.
+    """
+    import json
+    import urllib.request
+    key = env().get("E2B_API_KEY", "")
+    if not key:
+        log("cannot extend window: no E2B_API_KEY in the environment")
+        return False
+    req = urllib.request.Request(
+        f"https://api.e2b.app/sandboxes/{sandbox_id}/timeout",
+        data=json.dumps({"timeout": seconds}).encode(),
+        headers={"X-API-KEY": key, "Content-Type": "application/json"},
+        method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            log(f"window extended to {seconds}s for {sandbox_id} (HTTP {r.status})")
+            return True
+    except Exception as e:
+        log(f"window extension failed for {sandbox_id}: {e}")
+        return False
+
+
 def exec_in(sandbox_id: str, cmd: str, timeout=120):
     import e2b
     sbx = e2b.Sandbox.connect(sandbox_id)
@@ -143,6 +171,8 @@ def launch():
 
 def main():
     log("shepherd online")
+    if not env().get("E2B_API_KEY"):
+        log("WARNING: no E2B_API_KEY — every check will look like 'no sandboxes'")
     while True:
         try:
             boxes = inferolli_sandboxes()
@@ -166,6 +196,9 @@ def main():
                             subprocess.run([E2B, "sandbox", "resume", sid], env=env(), timeout=120)
                     except Exception as e:
                         log(f"resume failed: {e}")
+                    else:
+                        # the CLI gave us a 5-minute window — buy a real one now
+                        extend_window(sid)
                 boxes = inferolli_sandboxes()
             if not boxes:
                 log("no inferolli running — reviving")

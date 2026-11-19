@@ -128,6 +128,16 @@ def main():
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(sbx.sandbox_id)
 
+    # ...and INSIDE the sandbox. The start command's environment does not carry
+    # E2B_SANDBOX_ID (only exec sessions do), so the in-sandbox keepalive needs
+    # a file it can read to know which sandbox to extend.
+    for _ in range(20):
+        try:
+            sbx.files.write("/bot/data/sandbox-id", sbx.sandbox_id)
+            break
+        except Exception:
+            time.sleep(1)
+
     # THE fix: kill every OTHER running inferolli sandbox (by template, not by id)
     kill_all_inferolli(keep=sbx.sandbox_id)
 

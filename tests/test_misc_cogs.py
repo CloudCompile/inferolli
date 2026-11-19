@@ -100,14 +100,12 @@ class ServerPulseBlockTests(unittest.TestCase):
 
 
 class KeepaliveTests(unittest.TestCase):
-    """e2b_keepalive runs a keepalive ping only inside a sandbox. The gate is
-    inline in its loop, so the test pins the two conditions it requires."""
+    """The discovery/gate logic lives in tests/test_e2b_keepalive.py now.
 
-    def test_gate_requires_flag_and_sandbox_id(self):
-        import inspect
-        src = inspect.getsource(e2b_keepalive)
-        self.assertIn('E2B_KEEPALIVE", "") == "1"', src)
-        self.assertIn("sandbox_id", src)
+    It used to be asserted here by grepping the source for an inline env gate —
+    a test that passed happily while the gate was impossible to satisfy in the
+    start command's environment. Only the import guarantee is kept here.
+    """
 
     def test_module_imports_without_sandbox_env(self):
         # importing must never require E2B credentials (CI, local dev)

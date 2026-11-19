@@ -12,7 +12,22 @@ while [ ! -f /bot/.env ] && [ "$WAITED" -lt 600 ]; do
   WAITED=$((WAITED + 5))
 done
 if [ ! -f /bot/.env ]; then
-  echo "[start] no .env after 10 min — idling (dashboard-started sandbox?)"
+  # A sandbox created by a PREDECESSOR (the 24h reincarnation path) has no
+  # launcher to write this file, and the canonical copy lives in S3 — which we
+  # cannot reach without credentials. Chicken and egg. Creation envs DO reach
+  # the start command, so rebuild .env from them; the S3 restore below then
+  # replaces it with the real one.
+  echo "[start] no .env file — rebuilding it from the environment"
+  : > /bot/.env
+  for k in DISCORD_BOT_TOKEN INFERENCEPORT_API_KEY E2B_API_KEY AI_GATEWAY_KEY \
+           S3_ENDPOINT S3_BUCKET S3_ACCESS_KEY_ID S3_SECRET_ACCESS_KEY \
+           TONEARM_URL TONEARM_API_KEY TINYFISH_API_KEY; do
+    v="$(printenv "$k" 2>/dev/null || true)"
+    [ -n "$v" ] && printf '%s=%s\n' "$k" "$v" >> /bot/.env
+  done
+fi
+if [ ! -s /bot/.env ]; then
+  echo "[start] no .env and no credentials in the environment — idling"
   exec sleep infinity
 fi
 set -a; . /bot/.env; set +a
@@ -40,6 +55,34 @@ for _ in $(seq 1 20); do
   grep -q 'server password' /tmp/opencode-serve.log 2>/dev/null && break
   sleep 0.5
 done
+
+# --- our own runtime window: do not rely on the VPS being awake ---
+# `e2b sandbox resume` grants only 5 minutes by default, which is less than a
+# cold boot; without this the sandbox pauses again before the bot can ever
+# extend it, and from the outside that looks like the bot randomly stopping.
+export E2B_KEEPALIVE=1
+if [ -z "${E2B_SANDBOX_ID:-}" ] || [ "${E2B_SANDBOX_ID}" = "e2b.local" ]; then
+  if [ -s /bot/data/sandbox-id ]; then
+    export E2B_SANDBOX_ID="$(cat /bot/data/sandbox-id)"
+  fi
+fi
+if [ -n "${E2B_SANDBOX_ID:-}" ] && [ -n "${E2B_API_KEY:-}" ]; then
+  python3 - <<'EOPY' >> /bot/bot.log 2>&1
+import json, os, urllib.request
+sid, key = os.environ["E2B_SANDBOX_ID"], os.environ["E2B_API_KEY"]
+req = urllib.request.Request(
+    f"https://api.e2b.app/sandboxes/{sid}/timeout",
+    data=json.dumps({"timeout": 3600}).encode(),
+    headers={"X-API-KEY": key, "Content-Type": "application/json"}, method="POST")
+try:
+    with urllib.request.urlopen(req, timeout=15) as r:
+        print(f"[start] e2b window extended at boot (HTTP {r.status})")
+except Exception as e:
+    print(f"[start] e2b window extension FAILED: {e}")
+EOPY
+else
+  echo "[start] no sandbox id or API key — cannot extend the e2b window" >> /bot/bot.log
+fi
 
 # --- the stack watchdog: any dead piece gets revived (children of the start
 #     command survive; nothing exec-launched does — so this is the healer) ---
