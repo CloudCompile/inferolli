@@ -32,6 +32,13 @@ if [ ! -s /bot/.env ]; then
 fi
 set -a; . /bot/.env; set +a
 
+# --- restore the brain + the canonical .env from S3, BEFORE anything needs the
+#     real secrets (a reincarnated sandbox bootstraps a minimal .env above and
+#     only gets DISCORD_BOT_TOKEN / provider keys from this restore) ---
+echo "[start] restoring brain backup..."
+python -c "from cogs.backup import restore_latest; print('[start]', restore_latest())" 2>&1 | tail -1
+set -a; . /bot/.env; set +a
+
 # --- the desktop display: Xvfb on :99, XFCE4 riding on it ---
 Xvfb :99 -screen 0 1440x900x24 -nolisten tcp > /dev/null 2>&1 &
 export DISPLAY=:99
@@ -100,10 +107,6 @@ fi
   pgrep -f 'opencode serve' >/dev/null || \
     (nohup opencode serve --port 4096 > /tmp/opencode-serve.log 2>&1 &)
 done > /dev/null 2>&1 &)
-
-# --- restore latest brain backup from S3 (creds now sourced) ---
-echo "[start] restoring brain backup..."
-python -c "from cogs.backup import restore_latest; print('[start]', restore_latest())" 2>&1 | tail -1
 
 # --- run the bot under a supervisor loop (logs to /bot/bot.log) ---
 while true; do

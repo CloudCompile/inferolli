@@ -171,6 +171,7 @@ def launch():
 
 def main():
     log("shepherd online")
+    dead_checks: dict[str, int] = {}
     if not env().get("E2B_API_KEY"):
         log("WARNING: no E2B_API_KEY — every check will look like 'no sandboxes'")
     while True:
@@ -180,6 +181,13 @@ def main():
             # window and the process survives frozen. cheapest continuity there is.
             # (the SDK list() can't see paused sandboxes — use the CLI for this)
             paused = paused_inferolli()
+            if paused and boxes:
+                # A handover leaves the old sandbox paused while the successor
+                # runs. Resuming it would put two bots on the same token. Left
+                # paused on purpose (they cost nothing); the running one is king.
+                log(f"{len(paused)} paused sandbox(es) alongside a running one — "
+                    f"leaving them paused (leftovers from a handover)")
+                paused = []
             if paused:
                 live = {b[0] for b in boxes}
                 for sid in paused:
@@ -214,6 +222,29 @@ def main():
                     Path("/home/inferenceport/discord-bot/data/last-log.txt").write_text(tail)
                 except Exception:
                     pass
+                # is the bot actually running in there? a sandbox can be
+                # "running" while the bot is dead (bad restore, crashed boot).
+                try:
+                    alive = exec_in(newest_id,
+                                    "pgrep -f 'python -u bot.py' >/dev/null && echo UP || echo DOWN",
+                                    timeout=45)
+                    bot_down = "UP" not in alive
+                except Exception as e:
+                    log(f"cannot check the bot process: {e}")
+                    bot_down = True
+                if bot_down:
+                    dead_checks[newest_id] = dead_checks.get(newest_id, 0) + 1
+                    log(f"bot process NOT running in {newest_id} "
+                        f"({dead_checks[newest_id]} consecutive check(s))")
+                    if dead_checks[newest_id] >= 2:
+                        log("bot has been down for two checks — relaunching")
+                        dead_checks.pop(newest_id, None)
+                        launch()
+                        time.sleep(CHECK_EVERY_S)
+                        continue
+                else:
+                    dead_checks.pop(newest_id, None)
+
                 if age_h > MAX_AGE_H:
                     log(f"newest sandbox is {age_h:.1f}h old — migrating before the 24h wall")
                     try:

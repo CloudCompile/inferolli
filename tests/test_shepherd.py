@@ -144,3 +144,41 @@ class PausedParseTests(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+
+
+class WindowExtensionTests(unittest.TestCase):
+    """`e2b sandbox resume` grants 5 minutes — less than a cold boot. The
+    shepherd has to buy a real window right after every resume."""
+
+    def test_no_key_means_no_attempt(self):
+        from scripts import shepherd as sh
+        with mock.patch.object(sh, "env", lambda: {}):
+            self.assertFalse(sh.extend_window("sid123"))
+
+    def test_posts_the_timeout_with_the_key(self):
+        from scripts import shepherd as sh
+        captured = {}
+
+        class FakeResp:
+            status = 204
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def fake_urlopen(req, timeout=20):
+            captured["url"] = req.full_url
+            captured["key"] = req.headers.get("X-api-key") or req.headers.get("X-API-KEY")
+            captured["body"] = req.data
+            return FakeResp()
+
+        with mock.patch.object(sh, "env", lambda: {"E2B_API_KEY": "e2b_secret"}), \
+             mock.patch("urllib.request.urlopen", fake_urlopen):
+            self.assertTrue(sh.extend_window("ibsandbox1234567", 3600))
+        self.assertIn("/sandboxes/ibsandbox1234567/timeout", captured["url"])
+        self.assertEqual(captured["key"], "e2b_secret")
+        self.assertIn(b"3600", captured["body"])
+
+    def test_network_failure_is_contained(self):
+        from scripts import shepherd as sh
+        with mock.patch.object(sh, "env", lambda: {"E2B_API_KEY": "k"}), \
+             mock.patch("urllib.request.urlopen", side_effect=RuntimeError("boom")):
+            self.assertFalse(sh.extend_window("sid"))
