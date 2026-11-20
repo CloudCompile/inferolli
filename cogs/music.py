@@ -392,6 +392,69 @@ def _wake_sink(sink: str | None) -> None:
         log.debug("could not wake the studio sink", exc_info=True)
 
 
+# The application name Discord gives its *voice* playback stream. UI sounds
+# (the deafen blip) come from a different stream, `discord-canary`, which is
+# why one can be audible while the other is not.
+VOICE_STREAM_APP = "webrtc voiceengine"
+
+
+def _sink_inputs_listing() -> str:
+    try:
+        out = subprocess.run(["pactl", "list", "sink-inputs"],
+                             capture_output=True, text=True, timeout=5,
+                             env=_pulse_env())
+        return out.stdout or ""
+    except Exception:
+        log.debug("could not list sink inputs", exc_info=True)
+        return ""
+
+
+def _muted_voice_streams(listing: str) -> list[str]:
+    """Indexes of *muted* voice playback streams in a `pactl` listing.
+
+    Deafen mutes Discord's voice stream inside PulseAudio, and un-deafening
+    does not reliably lift it. Everything the bot can read then looks perfect:
+    dave ready, `can_encrypt` true, packets arriving, remote-user volume 1.0,
+    `deaf: false` — and the sink input still says `Mute: yes`, so the monitor
+    records silence. The UI's own blips are a different stream, so they stay
+    audible and make "the client can't reach the server" look true when it is
+    not. This is a mute no flag in the bot can see.
+    """
+    found: list[str] = []
+    idx: str | None = None
+    app = ""
+    muted = False
+
+    def close():
+        if idx is not None and muted and app.strip().lower() == VOICE_STREAM_APP:
+            found.append(idx)
+
+    for line in listing.splitlines():
+        s = line.strip()
+        if s.startswith("Sink Input #"):
+            close()
+            idx = s.split("#", 1)[1].strip()
+            app, muted = "", False
+        elif s.startswith("application.name = "):
+            app = s.split("=", 1)[1].strip().strip('"')
+        elif s.startswith("Mute:"):
+            muted = s.split(":", 1)[1].strip().lower() == "yes"
+    close()
+    return found
+
+
+def _unmute_voice_streams() -> list[str]:
+    """Lift that mute. Returns the indexes that were muted."""
+    indexes = _muted_voice_streams(_sink_inputs_listing())
+    for idx in indexes:
+        try:
+            subprocess.run(["pactl", "set-sink-input-mute", idx, "0"],
+                           capture_output=True, timeout=5, env=_pulse_env())
+        except Exception:
+            log.warning("could not unmute voice stream %s", idx, exc_info=True)
+    return indexes
+
+
 def _pick_sink(sinks: list[str], want: str) -> str | None:
     """Choose the studio's sink out of whatever the daemon lists.
 
@@ -1067,6 +1130,24 @@ class MusicCog(commands.Cog):
             await asyncio.sleep(0.25)
         return False
 
+    async def _unmute_client_voice(self, user) -> str:
+        """Lift a mute the client left on its own voice stream after deafen.
+
+        Only when the person has *not* deafened themselves right now: being
+        deafened is their choice, and a muted stream is then correct. Returns
+        a sentence for the person when a mute was actually cleared.
+        """
+        state = getattr(user, "voice", None)
+        if state is None or getattr(state, "self_deaf", False) or getattr(state, "deaf", False):
+            return ""
+        fixed = await asyncio.to_thread(_unmute_voice_streams)
+        if not fixed:
+            return ""
+        log.info("voice: client playback stream(s) %s were muted — unmuted",
+                 ", ".join(fixed))
+        return ("🎚 your client had its own voice stream muted inside the audio "
+                f"server (left over from deafen) — i unmuted it ({', '.join(fixed)})")
+
     async def _join(self, interaction: discord.Interaction):
         """Join (or move to) the asker's voice channel. Returns (vc, why_not)."""
         user = getattr(interaction, "user", None)
@@ -1089,6 +1170,10 @@ class MusicCog(commands.Cog):
                               "logged in somewhere")
         elif vc.channel != ch:
             await vc.move_to(ch)
+        # A mute left behind by deafen kills the audio without changing a
+        # single flag the bot can read (see _muted_voice_streams), so clear it
+        # here — every command that brings sound goes through this join.
+        self._client_mute_note = await self._unmute_client_voice(user)
         return vc, None
 
     async def _ensure_voice(self, interaction: discord.Interaction):
@@ -1240,6 +1325,15 @@ class MusicCog(commands.Cog):
                          f"dead={getattr(src, 'dead', '?')}")
         lines.append(f"**voice** {getattr(getattr(vc, 'channel', None), 'name', '?')} · "
                      f"connected={vc.is_connected()} · {self._voice_state_report(vc)}")
+        muted = await asyncio.to_thread(
+            lambda: _muted_voice_streams(_sink_inputs_listing()))
+        lines.append("**client out** "
+                     + (f"voice stream MUTED ({', '.join(muted)}) — this is deafen's "
+                        "leftover, and it silences everything i send"
+                        if muted else "voice stream unmuted"))
+        note = getattr(self, "_client_mute_note", "")
+        if note:
+            lines.append(note)
         return "\n".join(lines)
 
     async def _np_watcher(self, guild: discord.Guild):

@@ -210,6 +210,96 @@ class PulseRuntimeTests(unittest.TestCase):
             self.assertIsNone(music._pulse_env().get("XDG_RUNTIME_DIR") and music._pulse_runtime())
 
 
+class ClientMuteTests(unittest.TestCase):
+    """Deafen mutes Discord's *voice* stream inside PulseAudio, and un-deafening
+    does not reliably lift it. Every flag the bot can read then looks correct —
+    dave ready, can_encrypt true, packets arriving, `deaf: false` — while the
+    sink input still says `Mute: yes`. The deafen blip is a different stream
+    (`discord-canary`), so it stays audible and makes "your client cannot reach
+    the server" look true when the server was never the problem.
+    """
+
+    MUTED = (
+        "Sink Input #8\n"
+        "\tSink: 1\n"
+        "\tSample Specification: s16le 2ch 44100Hz\n"
+        "\tCorked: no\n"
+        "\tMute: yes\n"
+        "\tVolume: front-left: 65536 / 100% / 0.00 dB\n"
+        '\t\tmedia.name = "playStream"\n'
+        '\t\tapplication.name = "WEBRTC VoiceEngine"\n'
+        "\n"
+        "Sink Input #10\n"
+        "\tSink: 3\n"
+        "\tCorked: no\n"
+        "\tMute: no\n"
+        '\t\tapplication.name = "Google Chrome"\n'
+    )
+
+    def test_a_muted_voice_stream_is_found(self):
+        self.assertEqual(music._muted_voice_streams(self.MUTED), ["8"])
+
+    def test_an_unmuted_voice_stream_is_not_touched(self):
+        self.assertEqual(
+            music._muted_voice_streams(self.MUTED.replace("Mute: yes", "Mute: no")), [])
+
+    def test_the_studios_own_player_is_never_unmuted(self):
+        """Muting the machine is a choice; muting its voice output is the bug."""
+        listing = self.MUTED.replace("WEBRTC VoiceEngine", "Google Chrome")
+        self.assertEqual(music._muted_voice_streams(listing), [])
+
+    def test_clearing_the_mute_names_only_that_stream(self):
+        ran = []
+
+        def fake_run(cmd, **kwargs):
+            ran.append(cmd)
+            return mock.Mock(stdout=self.MUTED if cmd[:2] == ["pactl", "list"] else "")
+
+        with mock.patch.object(music.subprocess, "run", mock.Mock(side_effect=fake_run)):
+            self.assertEqual(music._unmute_voice_streams(), ["8"])
+        muted = [c for c in ran if c[:2] == ["pactl", "set-sink-input-mute"]]
+        self.assertEqual(muted, [["pactl", "set-sink-input-mute", "8", "0"]])
+
+    def _cog(self):
+        return music.MusicCog(bot=mock.Mock())
+
+    def _user(self, self_deaf=False):
+        user = mock.Mock()
+        user.voice = mock.Mock(self_deaf=self_deaf, deaf=self_deaf)
+        return user
+
+    def test_a_deafened_person_keeps_their_silence(self):
+        patched = mock.Mock(return_value=["8"])
+        with mock.patch.object(music, "_unmute_voice_streams", patched):
+            note = asyncio.run(self._cog()._unmute_client_voice(self._user(True)))
+        self.assertEqual(note, "")
+        patched.assert_not_called()
+
+    def test_an_undeafened_person_gets_the_mute_cleared(self):
+        with mock.patch.object(music, "_unmute_voice_streams", mock.Mock(return_value=["8"])):
+            note = asyncio.run(self._cog()._unmute_client_voice(self._user(False)))
+        self.assertIn("unmuted", note)
+        self.assertIn("8", note)
+
+    def test_nothing_muted_means_no_message(self):
+        with mock.patch.object(music, "_unmute_voice_streams", mock.Mock(return_value=[])):
+            self.assertEqual(
+                asyncio.run(self._cog()._unmute_client_voice(self._user(False))), "")
+
+    def test_the_report_names_a_muted_client_stream(self):
+        vc = mock.Mock()
+        vc.is_connected.return_value = True
+        vc.source = None
+        vc.channel = mock.Mock(name="hangout-voice")
+        cog = self._cog()
+        with mock.patch.object(music, "_sink_name", mock.Mock(return_value="inferolli_studio")), \
+             mock.patch.object(music, "_sink_inputs_listing", mock.Mock(return_value=self.MUTED)), \
+             mock.patch.object(music, "_get", mock.AsyncMock(return_value={"title": "x"})):
+            report = asyncio.run(cog._audio_report(vc))
+        self.assertIn("MUTED", report)
+        self.assertIn("deafen", report)
+
+
 class AttachTests(unittest.TestCase):
     """The bot must not claim success unless sound is actually flowing."""
 
