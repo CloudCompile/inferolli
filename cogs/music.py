@@ -332,6 +332,50 @@ async def _song_ids(kind: str, rid: str) -> list[str]:
 
 # ---------------------------------------------------------------- playback
 
+async def _stream_probe() -> tuple[bool, str | None]:
+    """Can we actually pull audio out of the studio right now?
+
+    /audio/status is NOT the answer: its `running` flag is true only while a
+    listener is already attached (tonearm drops the pipeline when the last one
+    leaves), so on the first join it always reads false — gating on it left the
+    bot sitting in the voice channel, silent. Ask the stream itself instead,
+    the same URL and the same route ffmpeg is about to use.
+
+    A silent-but-flowing stream is the other failure (Apple paused), so the
+    player state is checked too: real bytes, and something actually playing.
+    """
+    if not _configured():
+        return False, "the studio isn't wired up yet 🎧"
+    paused = False
+    try:
+        np = await _get("/playback/now-playing")
+        paused = np.get("isPlaying") is False
+    except Exception:
+        log.debug("stream probe: now-playing unavailable", exc_info=True)
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, read=8.0)) as c:
+            async with c.stream("GET", f"{URL}/api/audio/stream.mp3",
+                                params={"api_key": KEY}) as r:
+                if r.status_code >= 400:
+                    return False, (f"the studio's stream said HTTP {r.status_code} — "
+                                   f"that's my bug to fix, not yours")
+                got = 0
+                async for chunk in r.aiter_bytes():
+                    got += len(chunk)
+                    if got >= 8192:
+                        break
+    except Exception as exc:
+        log.warning("stream probe failed: %s", exc)
+        return False, ("the studio isn't answering yet — it takes a few seconds "
+                       "after boot; try again in a moment")
+    if got < 2048:
+        return False, ("the studio's audio pump sent nothing back — it's still "
+                       "starting up, try again in a moment")
+    if paused:
+        return False, "the studio's player is paused — run `/resume` and I'll stream it"
+    return True, None
+
+
 async def _queue_playlist_tracks(playlist_id: str, limit: int = 40) -> dict:
     """Play a library playlist by building the queue one track at a time.
 
@@ -716,43 +760,64 @@ class MusicCog(commands.Cog):
 
     # ---------- voice ----------
 
-    async def _ensure_voice(self, interaction: discord.Interaction) -> discord.VoiceClient | None:
-        """Join (or move to) the requester's voice channel and start the live stream."""
+    async def _ensure_voice(self, interaction: discord.Interaction):
+        """Join (or move to) the requester's voice channel and start the live stream.
+
+        Returns (voice_client, why_not). `why_not` is a sentence a person can
+        act on when we couldn't bring audio, and None when we did.
+        """
         user = getattr(interaction, "user", None)
         if not user or not getattr(user, "voice", None) or not user.voice.channel:
-            return None
+            return None, "join a voice channel first and I'll bring the music 🎧"
         ch = user.voice.channel
         vc = interaction.guild.voice_client
         perms = ch.permissions_for(ch.guild.me)
         if vc is None or not vc.is_connected():
             if not (perms.connect and perms.speak):
-                return None
+                return None, f"i can't join {ch.mention} — check my Connect/Speak permissions"
             vc = await ch.connect(self_deaf=True)
         elif vc.channel != ch:
             await vc.move_to(ch)
-        if not vc.is_playing():
-            # preflight the studio's audio pump. NB: the stream endpoint has
-            # no HEAD support (405), so the old HEAD probe always failed and
-            # /play never joined a voice channel. /api/audio/status is the
-            # honest check — it reports whether the pump is running at all.
-            try:
-                st = await _get("/audio/status")
-            except Exception:
-                return None  # studio isn't reachable/streaming
-            if not st.get("running"):
-                return None  # no live session yet (browser not playing)
-            src = discord.FFmpegPCMAudio(
-                f"{URL}/api/audio/stream.mp3?api_key={KEY}",
-                before_options=["-loglevel", "error"],
-                options="-vn")
-            vc.play(discord.PCMVolumeTransformer(src, volume=0.8))
-        return vc
+        if vc.is_playing():
+            return vc, None
+        # Probe the pipeline by pulling a little of the exact URL ffmpeg will
+        # use. NOT /audio/status: its `running` flag is only true while a
+        # listener is already attached (tonearm drops the pipeline when the
+        # last one leaves), so gating on it meant the first join always
+        # "failed" — the bot sat in the channel, silent, forever.
+        why = await self._start_stream(vc)
+        if why:
+            return None, why
+        return vc, None
+
+    async def _start_stream(self, vc) -> str | None:
+        """Probe, then attach the live stream. Returns why-not, or None on success."""
+        ok, why = await _stream_probe()
+        if not ok:
+            return why
+        player = discord.FFmpegPCMAudio(
+            f"{URL}/api/audio/stream.mp3?api_key={KEY}",
+            before_options=["-loglevel", "error"],
+            options="-vn")
+        vc.play(discord.PCMVolumeTransformer(player, volume=0.8),
+                after=lambda exc: log.warning("voice stream ended: %s", exc) if exc else None)
+        return None
 
     async def _np_watcher(self, guild: discord.Guild):
-        """While a voice party is live, post track changes to the listening post."""
+        """While a voice party is live: post track changes, and keep the audio up.
+
+        The stream can die without anyone touching Discord — tonearm tears its
+        pipeline down whenever a listener disconnects, and a crashed pipeline
+        answers status with `running: true` while encoding nothing. Silence that
+        nobody notices is the worst outcome, so this refreshes the player when
+        it has stopped but people are still in the channel (capped, with a log,
+        so a genuinely dead studio can't spin forever).
+        """
         await self.bot.wait_until_ready()
         post = discord.utils.get(guild.text_channels, name=LISTENING_POST)
+        failures = 0
         while guild.voice_client and guild.voice_client.is_connected():
+            vc = guild.voice_client
             try:
                 np = await _get("/playback/now-playing")
                 track = f"{np.get('title')}|{np.get('artist')}"
@@ -762,7 +827,15 @@ class MusicCog(commands.Cog):
                         await post.send(embed=_np_embed(np))
             except Exception:
                 log.debug("np watcher hiccup", exc_info=True)
-            await discord.utils.sleep(20)
+            if not vc.is_playing() and failures < 3:
+                why = await self._start_stream(vc)
+                if why:
+                    failures += 1
+                    log.warning("stream restart %d/3 refused: %s", failures, why)
+                else:
+                    failures = 0
+                    log.info("stream restarted in %s", getattr(vc.channel, "name", "?"))
+            await asyncio.sleep(20)
 
     # ---------- shared play plumbing ----------
 
@@ -778,11 +851,12 @@ class MusicCog(commands.Cog):
             log.debug("now-playing unavailable right after play", exc_info=True)
         if not np.get("title"):
             np = {"title": label or "queued", "artist": "", "isPlaying": True}
-        vc = None
+        vc, why_not = None, None
         try:
-            vc = await self._ensure_voice(interaction)
-        except Exception:
+            vc, why_not = await self._ensure_voice(interaction)
+        except Exception as exc:
             log.warning("voice join failed", exc_info=True)
+            why_not = f"i couldn't get into the voice channel — {str(exc)[:100]}"
         bits = [KIND_WORD.get(kind, kind)]
         if summary.get("skipped"):
             bits.append(f"{summary['skipped']} unavailable track(s) skipped")
@@ -790,10 +864,16 @@ class MusicCog(commands.Cog):
             bits.append(f"{summary['queued']} queued")
         if vc:
             bits.append(f"streaming into {vc.channel.mention}")
+        elif why_not:
+            # never say "streaming" when nobody is hearing anything
+            embed_note = why_not
+            bits.append("no audio — see below")
         elif summary.get("mode") == "song":
             bits.append("on the studio player")
         embed = _np_embed(np)
         embed.set_footer(text=" · ".join(bits))
+        if why_not and not vc:
+            embed.description = f"{embed.description}\n\n⚠️ {embed_note}" if embed.description else f"⚠️ {embed_note}"
         if vc and interaction.guild and (self._np_task is None or self._np_task.done()):
             self._np_task = self.bot.loop.create_task(self._np_watcher(interaction.guild))
         return embed
@@ -981,14 +1061,9 @@ class MusicCog(commands.Cog):
         if not _configured():
             return await interaction.response.send_message("the studio isn't wired up yet 🎧", ephemeral=True)
         await interaction.response.defer()
-        vc = await self._ensure_voice(interaction)
+        vc, why_not = await self._ensure_voice(interaction)
         if vc is None:
-            has_voice_ch = bool(interaction.user.voice and interaction.user.voice.channel)
-            return await interaction.followup.send(
-                "🎧 I couldn't start the stream — either the studio has no live session yet "
-                "(the Apple player needs to be logged in and playing), or I can't reach that "
-                "voice channel." if has_voice_ch else
-                "join a voice channel first and I'll bring the music 🎧")
+            return await interaction.followup.send(f"🎧 {why_not or 'couldn’t start the stream'}")
         self._np_task = self.bot.loop.create_task(self._np_watcher(interaction.guild))
         from cogs.pings import mention_for
         mt = await mention_for(interaction.guild, "music")
