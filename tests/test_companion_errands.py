@@ -53,6 +53,38 @@ class ErrandTests(unittest.TestCase):
         self.assertEqual(_desktop_errand("search on inferenceport.ai"),
                          "https://www.google.com/search?q=inferenceport.ai")
 
+    def test_a_search_bar_is_a_noun_not_a_verb(self):
+        """The gd-webport incident: 'find peam palms using the search bar'
+        became a Google search for 'bar' — sent twice, and the note told the
+        agent the job was already done, so it stopped actually doing it."""
+        self.assertIsNone(_desktop_errand(
+            "okay, i fixed the bug, use the open page and go to the community "
+            "levels and find peam palms using the search bar"))
+        self.assertIsNone(_desktop_errand(
+            "I MEANT THE SEARCH BAR AFTER YOU OPEN GEOMETRY DASH AND THEN OPEN "
+            "THE COMMUNITY LEVELS TAB AND SEARCH IN THE IN GAME SEARCH BAR"))
+        # but a real web search still works
+        self.assertEqual(_desktop_errand("search for peam palms"),
+                         "https://www.google.com/search?q=peam+palms")
+
+    def test_compound_desktop_instructions_are_left_to_the_agent(self):
+        """Imperatives before the search verb mean a multi-step desktop job —
+        flattening it into a Google query hijacks the message."""
+        self.assertIsNone(_desktop_errand(
+            "open the game and search for peam palms"))
+        self.assertIsNone(_desktop_errand(
+            "click the search icon then type peam palms in the search bar"))
+
+    def test_render_failures_are_detected_in_the_browser_log(self):
+        from cogs.companion import _render_fail_in
+        dead = ("[51613:51613:ERROR:gpu/command_buffer/service/context_group.cc:148] "
+                "ContextResult::kFatalFailure: WebGL2 blocklisted")
+        self.assertIn("error card", _render_fail_in(dead))
+        self.assertIn("error card", _render_fail_in(
+            "net::ERR_NAME_NOT_RESOLVED at https://nope.invalid"))
+        self.assertEqual(_render_fail_in("loaded fine, no errors"), "")
+        self.assertEqual(_render_fail_in(""), "")
+
 
 if __name__ == "__main__":
     unittest.main()

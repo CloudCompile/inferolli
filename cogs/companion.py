@@ -92,6 +92,24 @@ _URL_RX = re.compile(r"(?:open|go\s+to|navigate\s+to|visit|load)\s+"
 _SEARCH_RX = re.compile(r"(?:search|google|look\s+up|look\s+for)\s+"
                         r"(?:the\s+web\s+)?(?:for\s+|about\s+)?(.+)", re.I)
 
+# "search" as a NOUN is not a web-search request: "use the search bar", "the
+# in-game search". Mask those phrases before hunting for the verb — otherwise
+# "find peam palms using the search bar" becomes a Google search for "bar" and
+# the fast path hijacks a desktop instruction it was never meant to touch.
+_SEARCH_NOUN_RX = re.compile(
+    r"\bsearch(?:es)?\s+"
+    r"(?:bar|bars|box|boxes|field|fields|menu|menus|tab|tabs|button|buttons|"
+    r"icon|icons|page|pages|engine|results?|terms?)\b", re.I)
+
+# A desktop-interaction imperative BEFORE the search verb means the message is
+# a compound instruction ("open geometry dash and search in the in-game
+# search bar") — too much context for the fast path to flatten into a Google
+# query. Leave it to the agent, which can actually drive the desktop.
+_PRE_SEARCH_IMPERATIVE_RX = re.compile(
+    r"\b(?:open|opens|click|clicks|go\s+to|go\s+into|go\s+back|navigate|"
+    r"visit|load|loads|play|plays|press|type|types|tap|taps|hit|hits|select|"
+    r"scroll|drag|swipe|close|closes|restart|restarts|refresh)\b", re.I)
+
 
 def _desktop_errand(text: str) -> str | None:
     """If the message is a screen errand ("open X", "search Y"), return the URL
@@ -104,10 +122,18 @@ def _desktop_errand(text: str) -> str | None:
     # and the specific one is the later ("search about X")
     # word-boundary on BOTH sides: "research" contains "search" and used to
     # hijack the whole message into a Google search for "and tell us your opinios"
+    # noun usages ("the search bar") are masked out first
+    scrubbed = _SEARCH_NOUN_RX.sub(" ", text or "")
     verbs = list(re.finditer(r"\b(?:search|google|look\s+up|look\s+for)\b",
-                             text or "", re.I))
+                             scrubbed, re.I))
     if verbs:
-        rest = (text or "")[verbs[-1].end():]
+        # instructions before the search verb ("open geometry dash and then
+        # search...") mean this is a compound desktop job, not a web search
+        before = scrubbed[:verbs[-1].start()]
+        if _PRE_SEARCH_IMPERATIVE_RX.search(before):
+            return None
+    if verbs:
+        rest = scrubbed[verbs[-1].end():]
         rest = re.sub(r"^\s*(?:the\s+web\s+)?(?:_?for|about|on|to)\s+", "", rest, flags=re.I)
         # trailing instruction clauses are not part of the query (require
         # whitespace after punctuation so version numbers like 6.2 survive)
@@ -122,6 +148,31 @@ def _desktop_errand(text: str) -> str | None:
             from urllib.parse import quote_plus
             return "https://www.google.com/search?q=" + quote_plus(q)
     return None
+
+
+_RENDER_FAIL_RX = re.compile(
+    r"kFatalFailure|WebGL[^\n]{0,40}blocklist|ERR_INTERNET_DISCONNECTED|"
+    r"ERR_NAME_NOT_RESOLVED|ERR_CONNECTION_REFUSED", re.I)
+
+
+def _render_fail_in(tail: str) -> str:
+    """Read a browser-log tail, say whether the page actually rendered. A
+    screenshot existing proves nothing: a WebGL page that died renders a
+    perfect screenshot of an error card, and the agent — who never sees the
+    image — once narrated 'the layout's there' off exactly that."""
+    if "kFatalFailure" in tail or _RENDER_FAIL_RX.search(tail):
+        return ("the browser logged fatal render errors on that page — the "
+                "screenshot is likely an error card, NOT the page itself")
+    return ""
+
+
+def _page_render_warnings() -> str:
+    """What the browser said while loading the last errand page."""
+    try:
+        with open("/tmp/chromium.log", errors="ignore") as f:
+            return _render_fail_in(f.read()[-6000:])
+    except OSError:
+        return ""
 
 
 def _run_screen_errand(url: str, settle: float = 14.0) -> str | None:
@@ -404,13 +455,26 @@ class CompanionCog(commands.Cog):
                             _clear_outbox([shot])   # delivered: don't attach again
                         except (discord.HTTPException, OSError) as e:
                             log.warning("could not deliver errand screenshot (%s)", str(e)[:80])
+                    # the deterministic errand reports BY FILE EXISTENCE — a WebGL
+                    # page that dies still produces a perfect screenshot of an error
+                    # card, and the agent (who never sees the image) narrated
+                    # "the layout's there" off exactly that. So: the agent is told
+                    # it has NOT seen the screen, and what the browser log says.
+                    warn = await asyncio.get_event_loop().run_in_executor(
+                        None, _page_render_warnings)
                     errand_note = (
-                        f"\n\n[already done: you opened {errand_url} on your desktop and "
-                        f"the screenshot was sent to the channel — comment on it in one "
-                        f"dry line, don't describe taking it and don't re-send files]"
+                        f"\n\n[already done deterministically: you opened {errand_url} "
+                        f"on your desktop and the screenshot was sent to the channel. "
+                        f"You have NOT seen that screenshot — never describe what's "
+                        f"on it or claim the page loaded. If you want to say what the "
+                        f"screen shows, take your own screenshot (scrot to the outbox) "
+                        f"and look at it first. Don't re-send files]"
                         if shot else
-                        f"\n\n[you opened {errand_url} on your desktop but the screenshot "
-                        f"failed — say the page is on screen and couldn't be captured]")
+                        f"\n\n[you opened {errand_url} on your desktop but the "
+                        f"screenshot failed — say the page is on screen and couldn't "
+                        f"be captured]")
+                    if warn:
+                        errand_note += f"\n[{warn} — say so plainly]"
 
             excerpt = await self._context_text(message.channel, message)
             mem = await memory.get_user(message.author.id, message.author.display_name)
@@ -577,9 +641,39 @@ class CompanionCog(commands.Cog):
                                              "instructions", len(brief) + len(user),
                                              __import__("cogs.computer", fromlist=["x"]).OC_PROMPT_MAX,
                                              len(brief))
-                                    draft = await asyncio.wait_for(
-                                        oc_ask(sid, brief + user, timeout=200.0),
-                                        timeout=210.0)
+                                    # A multi-step desktop job (open the game,
+                                    # click through menus, wait for loads) can
+                                    # outrun a normal chat turn by a lot. The
+                                    # old single 210s wait meant a long turn
+                                    # produced NO reply at all: the agent worked
+                                    # in the background while the channel got
+                                    # silence, turn after turn. So: wait, then
+                                    # post an honest interim note, then keep
+                                    # waiting — the reply still lands, later.
+                                    oc_task = asyncio.ensure_future(
+                                        oc_ask(sid, brief + user, timeout=480.0))
+                                    try:
+                                        draft = await asyncio.wait_for(
+                                            asyncio.shield(oc_task), timeout=180.0)
+                                    except asyncio.TimeoutError:
+                                        try:
+                                            await message.reply(
+                                                "on it — this one's a multi-step "
+                                                "desktop job, give me a couple "
+                                                "of minutes", mention_author=False)
+                                            log.info("interim note sent "
+                                                     "(oc turn still running)")
+                                        except discord.HTTPException:
+                                            pass
+                                        try:
+                                            draft = await asyncio.wait_for(
+                                                asyncio.shield(oc_task), timeout=180.0)
+                                        except asyncio.TimeoutError:
+                                            log.warning("oc turn abandoned after "
+                                                        "~360s — falling back")
+                                            draft = None
+                                    if not oc_task.done():
+                                        oc_task.cancel()
                                     if draft:
                                         reply = draft.strip()
                                         # the same envelope rules as the tool loop: the agent

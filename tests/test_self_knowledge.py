@@ -86,6 +86,26 @@ class SelfKnowledgeTests(unittest.TestCase):
         computer_src = pathlib.Path("cogs/computer.py").read_text()
         self.assertIn("--enable-unsafe-swiftshader", computer_src)
 
+    def test_a_long_desktop_turn_never_goes_silent(self):
+        """The gd-webport incident, part 2: a multi-step desktop job outran
+        the single 210s reply wait, so three turns in a row produced NO reply —
+        the agent worked in the background while the channel got silence. The
+        reply path now waits, posts an honest interim note, and keeps waiting."""
+        src = pathlib.Path("cogs/companion.py").read_text()
+        self.assertIn("asyncio.shield(oc_task)", src)
+        self.assertIn("give me a couple", src)
+        self.assertIn("interim note sent", src)
+
+    def test_the_errand_note_forbids_claiming_the_unseen(self):
+        """Part 3: the deterministic errand's note used to say 'comment on it
+        in one dry line' — the agent never sees the screenshot it sent, and
+        narrated 'the layout's there' off a WebGL error card."""
+        src = pathlib.Path("cogs/companion.py").read_text()
+        self.assertIn("You have NOT seen that screenshot", src)
+        self.assertIn("_page_render_warnings", src)
+        self.assertIn("error card", src)
+        self.assertNotIn("comment on it in one dry line", src)
+
 
 class PromptTruncationTests(unittest.TestCase):
     def test_prompt_cap_fits_the_instructions(self):
