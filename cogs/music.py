@@ -851,7 +851,7 @@ class MusicCog(commands.Cog):
             log.debug("now-playing unavailable right after play", exc_info=True)
         if not np.get("title"):
             np = {"title": label or "queued", "artist": "", "isPlaying": True}
-        vc, why_not = None, None
+        vc, why_not, embed_note = None, None, None
         try:
             vc, why_not = await self._ensure_voice(interaction)
         except Exception as exc:
