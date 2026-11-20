@@ -1,22 +1,27 @@
-"""Crew standings — the nightly level system, judged by the decision model.
+"""Crew standings — an XP ladder with a nightly AI spark bonus.
 
-After the dream consolidates memories, each ACTIVE member's week is reviewed:
-their messages (quality, from the 7-day archive), interactivity (channels,
-distinct partners), and likedness (reactions tallied from channel history).
+The old system was judged nightly by the decision model on a 0-100 "score":
+opaque to members, and roles flapped up and down on the model's mood. The
+redesign keeps the character but changes the physics:
 
-The decision model (microsoft/decision-1) places each member in a tier and
-flags "sparks" of the community. Score movement is transparent math on top —
-promotions require decision confidence, demotions are gentler. The chat
-model writes each promotion's one-line citation. Standings post nightly.
+* XP is earned deterministically — talking (+5, at most once a minute) and
+  getting reacted on (+2). Nobody can be judged downward out of a rank.
+* Tiers sit at fixed XP thresholds, and the ladder absorbed the stray rank
+  roles that had drifted in over the years (Crew, Research Diver, First
+  Mate, Captain) so there is exactly one ladder, ten rungs, no duplicates.
+* The nightly decision model still reads the week — but all it can do now
+  is hand a small SPARK bonus (+25) to members whose presence made the
+  server better, with a one-line citation. Demotion is no longer a thing.
+
+Standings post nightly, right after the dream consolidates.
 """
 
 import asyncio
 import json
 import logging
 from pathlib import Path
-import math
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 from datetime import datetime, timezone
 
 import discord
@@ -31,33 +36,72 @@ from config import get as get_cfg
 log = logging.getLogger("cogs.levels")
 
 TIER_NAMES = [t[0] for t in memory.TIERS]
-MAX_JUDGED_PER_NIGHT = 15          # top-N active members evaluated (cost bound)
-PROMOTE_CONFIDENCE = 0.65
-DEMOTE_CONFIDENCE = 0.55
-STANDINGS_SIZE = 8
+MAX_JUDGED_PER_NIGHT = 15          # top-N active members reviewed (cost bound)
+SPARK_CONFIDENCE = 0.6
 
-ROLE_COLOURS = {                    # nautical gradient: driftwood → gold
+XP_PER_MESSAGE = 5
+XP_PER_REACTION = 2
+XP_COOLDOWN_S = 60                 # at most one message award per minute
+SPARK_XP = 25                      # the nightly model's bonus for being a spark
+
+# nautical gradient: driftwood → seabed teals → brass → gold
+TIER_COLOURS = {
     "🪵 Landlubber": 0x9AA0A6,
     "🪝 Deckhand": 0xA0785A,
+    "🚢 Crew": 0xC4A67A,
     "⚓ Sailor": 0x4A90D9,
     "🧭 Navigator": 0x2EC4B6,
+    "🔬 Research Diver": 0x1F8A70,
     "⛵ Bosun": 0xE8A33D,
+    "🎖️ First Mate": 0xD98E32,
+    "🚩 Captain": 0xE74C3C,
     "👑 Admiral": 0xF1C40F,
+}
+
+# The strays folded into the ladder. ⚓ and 🧭 were each used twice (Sailor vs
+# Captain, Navigator vs First Mate), so the absorbed roles get new emojis
+# rather than ladder twins that render identically.
+LADDER_RENAMES = {
+    "🧭 First Mate": "🎖️ First Mate",
+    "⚓ Captain": "🚩 Captain",
 }
 
 
 async def ensure_level_roles(guild: discord.Guild) -> dict:
-    """Find-or-create the six level roles. Returns {tier_name: role}."""
+    """Find-or-create the ladder roles, merging the strays in. Returns
+    {tier_name: role}. Also repaints roles that kept an old colour."""
     roles = {}
-    for tier, colour in ROLE_COLOURS.items():
+    for tier, colour in TIER_COLOURS.items():
+        hoist = tier in ("🎖️ First Mate", "🚩 Captain", "👑 Admiral")
         role = discord.utils.get(guild.roles, name=tier)
         if role is None:
+            old_name = LADDER_RENAMES.get(tier)
+            if old_name:
+                role = discord.utils.get(guild.roles, name=old_name)
+                if role is not None:
+                    try:
+                        await role.edit(
+                            name=tier, colour=discord.Colour(colour),
+                            reason="ladder merge: stray rank role folded in")
+                        log.info("ladder merge: renamed %r to %r", old_name, tier)
+                    except discord.Forbidden:
+                        log.warning("ladder merge refused for %r (perms)", old_name)
+        if role is None:
             try:
+                # only the top of the ladder hoists — ten hoisted roles would
+                # shred the member sidebar
                 role = await guild.create_role(
                     name=tier, colour=discord.Colour(colour),
-                    hoist=True, reason="crew standings ladder")
+                    hoist=tier in ("🎖️ First Mate", "🚩 Captain", "👑 Admiral"),
+                    reason="crew standings ladder")
             except discord.Forbidden:
                 return {}
+        elif role.colour.value != colour:
+            try:
+                await role.edit(colour=discord.Colour(colour),
+                                reason="crew standings ladder repaint")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
         roles[tier] = role
     return roles
 
@@ -71,24 +115,36 @@ async def sync_member_tier(guild: discord.Guild, uid: int, tier: str, all_roles:
     if wanted is None:
         return
     try:
-        current = [r for r in member.roles if r.name in ROLE_COLOURS and r.id != wanted.id]
+        current = [r for r in member.roles
+                    if r.name in TIER_COLOURS and r.id != wanted.id]
         if wanted not in member.roles:
-            await member.add_roles(wanted, reason="nightly crew standings")
+            await member.add_roles(wanted, reason="crew standings ladder")
         for old in current:
-            await member.remove_roles(old, reason="nightly crew standings")
+            await member.remove_roles(old, reason="crew standings ladder")
     except discord.Forbidden:
         log.warning("role sync refused for %s (hierarchy or perms)", uid)
 
 
-def _tier_index(name: str) -> int:
-    try:
-        return TIER_NAMES.index(name)
-    except ValueError:
-        return 0
+def _progress_bar(xp: float) -> str:
+    """▓ toward the next rung, ░ what's left."""
+    idx = next((i for i, (name, _) in enumerate(memory.TIERS) if name == memory.tier_for_xp(xp)), 0)
+    if idx + 1 >= len(memory.TIERS):
+        return "▓" * 8                      # top of the ladder
+    lo = memory.TIERS[idx][1]
+    hi = memory.TIERS[idx + 1][1]
+    frac = max(0.0, min(1.0, (xp - lo) / (hi - lo)))
+    filled = int(frac * 8)
+    return "▓" * filled + "░" * (8 - filled)
 
 
-async def tally_likes(guild: discord.Guild, top_channels: list[discord.TextChannel],
-                      per_channel: int = 60) -> dict[int, int]:
+def xp_to_next(xp: float) -> str:
+    idx = next((i for i, (name, _) in enumerate(memory.TIERS) if name == memory.tier_for_xp(xp)), 0)
+    if idx + 1 >= len(memory.TIERS):
+        return "top of the ladder ⚓"
+    return f"{memory.TIERS[idx + 1][1] - xp:.0f} XP to {memory.TIERS[idx + 1][0]}"
+
+
+async def tally_likes(guild: discord.Guild, top_channels: list, per_channel: int = 60) -> dict:
     """Reactions received, by author — from recent channel history."""
     tally = Counter()
     for ch in top_channels[:8]:
@@ -98,49 +154,132 @@ async def tally_likes(guild: discord.Guild, top_channels: list[discord.TextChann
                     continue
                 for r in m.reactions:
                     tally[m.author.id] += r.count
-        except (discord.HTTPException, Exception):
+        except Exception:
             continue
     return dict(tally)
-
-
-def _movement(score: float, tier_idx: int, conf: float) -> float:
-    """Move score toward the judged tier's band center; promotions need confidence."""
-    name, lo, hi = memory.TIERS[tier_idx]
-    center = (lo + hi) / 2
-    delta = (center - score) * 0.25          # pull 25% toward the judged center
-    return max(-6.0, min(8.0, delta))         # bounded nightly movement
 
 
 class LevelsCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self._last_run = 0.0
+        self._last_award = {}       # uid -> monotonic time of last message award
 
-    # ---------- nightly judgment ----------
+    # ---------- the XP engine ----------
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        if message.author.bot or message.guild is None:
+            return
+        now = time.monotonic()
+        if now - self._last_award.get(message.author.id, 0.0) < XP_COOLDOWN_S:
+            return
+        self._last_award[message.author.id] = now
+        await self._award(message.guild, message.author.id, XP_PER_MESSAGE)
+
+    @commands.Cog.listener()
+    async def on_reaction_add(self, reaction, user):
+        msg, author = reaction.message, reaction.message.author
+        if (user.bot or author.bot or user.id == author.id
+                or getattr(msg, "guild", None) is None):
+            return
+        # no isinstance(Member) guard here on purpose: the message author
+        # may have left the guild (a User, not a Member), but their XP bank
+        # doesn't care
+        await self._award(msg.guild, author.id, XP_PER_REACTION)
+
+    async def _award(self, guild, uid: int, amount: float) -> str | None:
+        """Add XP, persist, and pin the ladder role if the tier changed.
+        Returns the new tier if it changed, else None. XP only ever goes UP —
+        a negative or zero amount is rejected outright, which is what makes
+        demotion structurally impossible."""
+        if amount <= 0:
+            return None
+        r = await memory.get_rank(uid)
+        old_tier = r["tier"]
+        r["xp"] = r.get("xp", 0) + amount
+        r["tier"] = memory.tier_for_xp(r["xp"])
+        await memory.save_rank(uid, r)
+        if r["tier"] != old_tier:
+            tier_roles = await ensure_level_roles(guild)
+            if tier_roles:
+                await sync_member_tier(guild, uid, r["tier"], tier_roles)
+            log.info("crew ladder: uid %s → %s", uid, r["tier"])
+        return r["tier"] if r["tier"] != old_tier else None
+
+    # ---------- staff adjustments ----------
+
+    def _is_crew_admin(self, member: discord.Member) -> bool:
+        """Admins and the staff role can adjust XP by hand. The nightly
+        model can't — only people with a finger on the wheel can move a
+        member down, and it's logged in their history as a hand move."""
+        import helpers
+        if helpers.is_admin(member):
+            return True
+        return any(r.name.lower() == "staff" for r in getattr(member, "roles", []))
+
+    async def adjust_xp(self, guild: discord.Guild, uid: int, amount: float,
+                        by_name: str = "staff") -> dict:
+        """Staff-only XP move — the one path that may subtract. Returns
+        the updated rank with a `changed` flag for the tier."""
+        r = await memory.get_rank(uid)
+        old_tier = r["tier"]
+        r["xp"] = max(0.0, r.get("xp", 0) + amount)
+        r["tier"] = memory.tier_for_xp(r["xp"])
+        r["history"].append({
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "xp": round(r["xp"]), "tier": r["tier"],
+            "note": "hand", "reason": f"{by_name}: {'+' if amount >= 0 else ''}{amount:.0f} XP",
+        })
+        r["history"] = r["history"][-30:]
+        await memory.save_rank(uid, r)
+        if r["tier"] != old_tier:
+            tier_roles = await ensure_level_roles(guild)
+            if tier_roles:
+                await sync_member_tier(guild, uid, r["tier"], tier_roles)
+            log.info("crew ladder: staff moved uid %s %+.0f XP → %s",
+                     uid, amount, r["tier"])
+        return r
+
+    @app_commands.command(name="xp",
+                          description="Add or remove crew XP by hand (admin/staff)")
+    @app_commands.describe(member="Whose XP", amount="XP to add — negative to remove")
+    async def xp(self, interaction: discord.Interaction,
+                 member: discord.Member,
+                 amount: app_commands.Range[int, -100000, 100000]):
+        if not self._is_crew_admin(interaction.user):
+            return await interaction.response.send_message(
+                "that wheel is for admins and staff only", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        if member.bot:
+            return await interaction.followup.send("bots don't sail the ladder", ephemeral=True)
+        r = await self.adjust_xp(interaction.guild, member.id, amount,
+                                 by_name=interaction.user.display_name)
+        arrow = "⬆️" if r["tier"] != memory.tier_for_xp(
+            r["xp"] - amount) else ("⬇️" if amount < 0 else "•")
+        await interaction.followup.send(
+            f"{arrow} **{member.display_name}** is now **{r['tier']}** · "
+            f"{r['xp']:.0f} XP · {xp_to_next(r['xp'])}", ephemeral=True)
+
+    # ---------- nightly spark pass ----------
 
     async def run_nightly(self, guild: discord.Guild, post: bool = True) -> dict:
-        """Called by the dream after consolidation. Judge, move, post."""
+        """Called by the dream after consolidation. Sparks only — the model
+        can hand a bonus; it can never demote."""
         entries = await memory.stm_window(hours=24 * 7)
         if not entries:
             return {"judged": 0}
 
         activity = Counter(e["user_id"] for e in entries)
         names = {e["user_id"]: e["name"] for e in entries}
-        # top active humans (the bot doesn't rank itself)
         me_id = guild.me.id
         active = [(uid, n) for uid, n in activity.most_common(MAX_JUDGED_PER_NIGHT)
                   if uid != me_id]
 
-        # likedness: reactions across the busiest channels
         chans = [c for c in guild.text_channels
                  if c.permissions_for(guild.me).read_messages]
         chans.sort(key=lambda c: -(c.last_message_id or 0))
         likes = await tally_likes(guild, chans)
 
-        try:
-            pulse = self.bot.get_cog("ServerPulseCog")
-        except Exception:
-            pulse = None
         standings = []
         judged = 0
         for uid, msg_count in active:
@@ -153,23 +292,14 @@ class LevelsCog(commands.Cog):
                 f"member: {name}\n"
                 f"messages last 7d: {msg_count} across {len(chans_they)} channels ({', '.join(chans_they[:5])})\n"
                 f"reactions received (recent): {likes.get(uid, 0)}\n"
-                f"current standing: {r['tier']} ({r['score']:.0f}/100)\n"
+                f"current rank: {r['tier']} ({r['xp']:.0f} XP)\n"
                 f"sample of what they actually said:\n" + "\n".join(f"  - {s}" for s in sample)
             )
             questions = {
-                "tier": {
-                    "type": "choice",
-                    "instructions": (
-                        "I keep the crew standings of this Discord server. Based on this member's "
-                        "week — what they said (quality and spirit), how much they engage, and how "
-                        "the community reacts to them — which tier have they EARNED? Judge the "
-                        "person, not just the counts. Quiet-but-gold beats loud-but-empty."),
-                    "criteria": {t: t for t in TIER_NAMES},
-                },
                 "spark": {
                     "type": "choice",
                     "instructions": (
-                        "Is this member a positive SPARK of the community this week — someone "
+                        "Is this member a positive SPARK of this community this week — someone "
                         "whose presence made the server better (helpful, funny, kind, building "
                         "things)? Not just active — sparky."),
                     "criteria": {"yes": "a spark", "no": "just present"},
@@ -178,66 +308,49 @@ class LevelsCog(commands.Cog):
             try:
                 answers = await ai.decide(state[:1800], questions, timeout=25.0)
             except AIError as e:
-                log.warning("tier judgment failed for %s: %s", name, e)
+                log.warning("spark judgment failed for %s: %s", name, e)
                 continue
             judged += 1
 
-            tier = answers.get("tier", {})
-            chosen = tier.get("choice", r["tier"])
-            conf = float(tier.get("confidence", 0))
-            spark = answers.get("spark", {}).get("choice") == "yes"
+            spark = (answers.get("spark", {}).get("choice") == "yes"
+                     and float(answers.get("spark", {}).get("confidence", 0)) >= SPARK_CONFIDENCE)
+            prev_tier = r["tier"]
+            note, reason = "", ""
 
-            t_idx = _tier_index(chosen)
-            cur_idx = _tier_index(r["tier"])
-            delta = _movement(r["score"], t_idx, conf)
-            score = max(0.0, min(100.0, r["score"] + delta))
-
-            # promotion/demotion gates: decision confidence required
-            new_tier = r["tier"]
-            note = ""
-            if t_idx > cur_idx and conf >= PROMOTE_CONFIDENCE:
-                new_tier = chosen
-                note = "promoted"
-            elif t_idx < cur_idx and conf >= DEMOTE_CONFIDENCE:
-                new_tier = chosen
-                note = "stepped down"
-            elif spark and conf >= PROMOTE_CONFIDENCE:
+            if spark:
                 note = "spark"
-
-            reason = ""
-            if note or spark:
                 try:
                     reason = await ai.chat_for("quick", [
                         {"role": "system", "content": (
                             "You keep the crew standings. In AT MOST 10 words, one dry-witted "
-                            "lowercase line: why this member earned their place tonight. No quotes, "
+                            "lowercase line: what made this member a spark this week. No quotes, "
                             "no name, no period at the end unless it's funny")},
                         {"role": "user", "content": state[:800]},
                     ], max_tokens=40, temperature=0.9, timeout=20.0)
                     reason = reason.strip().strip('"').strip(".")
                 except (AIError, asyncio.TimeoutError):
                     reason = ""
+                r["xp"] = r.get("xp", 0) + SPARK_XP
+                r["tier"] = memory.tier_for_xp(r["xp"])
+                r["last_eval"] = time.time()
+                r["last_reason"] = reason or r.get("last_reason", "")
+                r["history"].append({
+                    "date": datetime.now().strftime("%Y-%m-%d"),
+                    "xp": round(r["xp"]), "tier": r["tier"],
+                    "note": "spark", "reason": reason,
+                })
+                r["history"] = r["history"][-30:]
+                await memory.save_rank(uid, r)
 
-            r_prev = r["score"]
-            prev_tier = r["tier"]
-            r.update(score=score, tier=new_tier, last_eval=time.time(),
-                     last_reason=reason or r.get("last_reason", ""))
-            r["history"].append({
-                "date": datetime.now().strftime("%Y-%m-%d"),
-                "score": round(score), "tier": new_tier,
-                "delta": round(score - r_prev), "reason": reason,
-            })
-            r["history"] = r["history"][-30:]
-            await memory.save_rank(uid, r)
             standings.append({
-                "uid": uid, "name": name, "tier": new_tier, "score": score,
+                "uid": uid, "name": name, "tier": r["tier"], "xp": r["xp"],
                 "prev_tier": prev_tier, "note": note, "reason": reason,
                 "spark": spark, "likes": likes.get(uid, 0), "msgs": msg_count,
             })
 
-        standings.sort(key=lambda s: -s["score"])
+        standings.sort(key=lambda s: -s["xp"])
 
-        # role-sync: make the ladder physical — wear the role you earned
+        # role-sync: make the ladder physical — wear the rank you earned
         if standings:
             tier_roles = await ensure_level_roles(guild)
             if tier_roles:
@@ -247,7 +360,6 @@ class LevelsCog(commands.Cog):
         result = {"judged": judged, "standings": standings}
         if post:
             await self.post_standings(guild, result)
-        self._last_run = time.time()
         return result
 
     # ---------- standings post ----------
@@ -259,19 +371,20 @@ class LevelsCog(commands.Cog):
         if chan is None or not chan.permissions_for(guild.me).send_messages:
             return
 
-        standings = sorted(result.get("standings", []), key=lambda s: -s["score"])
-        promos = [s for s in standings if s["note"] == "promoted"]
+        standings = sorted(result.get("standings", []), key=lambda s: -s["xp"])
         now = datetime.now(timezone.utc).strftime("%b %d")
 
         # ---- the living board: one pinned plain-text message, edited nightly ----
         lines = [f"⚓ CREW STANDINGS — {now}", "─" * 34]
         for i, s in enumerate(standings[:12]):
-            bar = "▓" * int(s["score"] / 12) + "░" * (8 - int(s["score"] / 12))
+            bar = _progress_bar(s["xp"])
             spark = " ✨" if s["spark"] else ""
-            lines.append(f"{i+1:>2}. {s['name'][:14]:<14} {s['tier']:<13} {s['score']:>3.0f} {bar}{spark}")
+            lines.append(f"{i+1:>2}. {s['name'][:14]:<14} {s['tier']:<18} "
+                         f"{s['xp']:>6.0f} XP {bar}{spark}")
         if not standings:
             lines.append("(the tide hasn't judged anyone yet)")
-        lines += ["", f"*judged nightly by the decision model · {result.get('judged', 0)} crew reviewed*"]
+        lines += ["", f"*ranks are earned by talking and being reacted on · the nightly "
+                      f"model hands ✨ spark bonuses · {result.get('judged', 0)} crew reviewed*"]
 
         # the board's id lives in the BACKED-UP data dir — in cogs/data/ it
         # survived in-process but not migration, so every migration pinned a
@@ -308,11 +421,12 @@ class LevelsCog(commands.Cog):
 
         # ---- tonight's moves: small plain-text message under the board ----
         moves = []
-        for s in promos[:4]:
-            moves.append(f"⬆️ **{s['name']}** → {s['tier']}" + (f" — *“{s['reason']}”*" if s["reason"] else ""))
         for s in standings:
-            if s["note"] == "stepped down":
-                moves.append(f"⬇️ **{s['name']}** → {s['tier']}")
+            if s["note"] == "spark":
+                moves.append(f"✨ **{s['name']}** +{SPARK_XP} XP"
+                             + (f" — *“{s['reason']}”*" if s["reason"] else ""))
+            elif s["tier"] != s["prev_tier"]:
+                moves.append(f"⬆️ **{s['name']}** → {s['tier']}")
         if moves:
             from cogs.pings import mention_for
             mt = await mention_for(guild, "standings")
@@ -321,31 +435,32 @@ class LevelsCog(commands.Cog):
 
     # ---------- commands ----------
 
-    @app_commands.command(name="rank", description="Check your (or someone's) crew standing")
+    @app_commands.command(name="rank", description="Check your (or someone's) crew rank")
     async def rank(self, interaction: discord.Interaction, member: discord.Member | None = None):
         who = member or interaction.user
         r = await memory.get_rank(who.id)
         e = discord.Embed(
             title=f"⚓ {who.display_name} — {r['tier']}",
-            description=f"standing: **{r['score']:.0f}/100**",
+            description=f"**{r['xp']:.0f} XP** · {xp_to_next(r['xp'])}\n{_progress_bar(r['xp'])}",
             colour=0x2B6D8C)
         if r.get("last_reason"):
             e.add_field(name="tonight's note", value=f"*“{r['last_reason']}”*", inline=False)
         for o in r.get("history", [])[-3:][::-1]:
             e.add_field(name=o["date"],
-                        value=f"{o['tier']} ({o['score']}) {o['reason'] and '— “' + o['reason'] + '”'}",
+                        value=f"{o['tier']} ({o.get('xp', '?')} XP)"
+                              + (f" — *“{o['reason']}”*" if o.get("reason") else ""),
                         inline=False)
         await interaction.response.send_message(embed=e, ephemeral=member is None)
 
     @app_commands.command(name="leaderboard", description="The crew standings")
     async def leaderboard(self, interaction: discord.Interaction):
         store = await memory.all_ranks()
-        ranked = sorted(store.items(), key=lambda kv: -kv[1].get("score", 0))[:10]
+        ranked = sorted(store.items(), key=lambda kv: -kv[1].get("xp", 0))[:10]
         if not ranked:
             return await interaction.response.send_message("the tide hasn't judged anyone yet ⚓",
                                                            ephemeral=True)
         body = "\n".join(
-            f"**{i+1}.** <@{uid}> — {r['tier']} ({r['score']:.0f})"
+            f"**{i+1}.** <@{uid}> — {r['tier']} ({r.get('xp', 0):.0f} XP)"
             for i, (uid, r) in enumerate(ranked))
         await interaction.response.send_message("⚓ **crew standings**\n" + body)
 

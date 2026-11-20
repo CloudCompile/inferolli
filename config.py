@@ -22,6 +22,9 @@ DEFAULTS = {
     "models_channel_id": None,       # channel for model-catalog updates
     "dreams_channel_id": None,       # channel where the nightly dream gets posted
     "levels_channel_id": None,       # channel for nightly crew standings
+    "roles_channel_id": None,        # channel holding the self-assign picker
+    "picker_message_id": None,       # the picker message (healed on boot)
+    "pickable_roles": [],            # role ids members can toggle themselves
     "automod": {
         "enabled": False,
         "delete_on_low": True,       # severity=low  -> delete message

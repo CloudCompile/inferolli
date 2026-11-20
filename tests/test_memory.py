@@ -97,12 +97,19 @@ class MemoryTests(unittest.TestCase):
     # ---- tiers ----
 
     def test_tier_boundaries(self):
-        cases = {0: "🪵 Landlubber", 19: "🪵 Landlubber", 20: "🪝 Deckhand",
-                 39: "🪝 Deckhand", 40: "⚓ Sailor", 59: "⚓ Sailor",
-                 60: "🧭 Navigator", 74: "🧭 Navigator", 75: "⛵ Bosun",
-                 89: "⛵ Bosun", 90: "👑 Admiral", 100: "👑 Admiral"}
-        for score, tier in cases.items():
-            self.assertEqual(memory.tier_for_score(score), tier, score)
+        cases = {0: "🪵 Landlubber", 99: "🪵 Landlubber", 100: "🪝 Deckhand",
+                 250: "🚢 Crew", 500: "⚓ Sailor", 1000: "🧭 Navigator",
+                 1750: "🔬 Research Diver", 2750: "⛵ Bosun",
+                 4000: "🎖️ First Mate", 6000: "🚩 Captain",
+                 9000: "👑 Admiral", 50000: "👑 Admiral"}
+        for xp, tier in cases.items():
+            self.assertEqual(memory.tier_for_xp(xp), tier, xp)
+
+    def test_xp_floor_migrates_old_scores(self):
+        """Members of the old AI-score system keep their tier; their XP
+        starts at that tier's floor."""
+        self.assertEqual(memory.xp_floor("⛵ Bosun"), 2750)
+        self.assertEqual(memory.xp_floor("not a tier"), 0.0)
 
     def test_affinity_tiers(self):
         self.assertEqual(memory.affinity_tier(75), "day-one")
@@ -116,13 +123,13 @@ class MemoryTests(unittest.TestCase):
     def test_rank_defaults_and_roundtrip(self):
         async def go():
             r = await memory.get_rank(7)
-            r["score"] = 55
+            r["xp"] = 550
             r["tier"] = "⚓ Sailor"
             await memory.save_rank(7, r)
             return await memory.get_rank(7), await memory.all_ranks()
 
         got, all_ = self.run_async(go())
-        self.assertEqual(got["score"], 55)
+        self.assertEqual(got["xp"], 550)
         self.assertEqual(got["tier"], "⚓ Sailor")
         self.assertIn("7", all_)
 
@@ -131,6 +138,14 @@ class MemoryTests(unittest.TestCase):
         r = self.run_async(memory.get_rank(7))
         self.assertEqual(r["tier"], memory.TIERS[0][0])
         self.assertEqual(r["history"], [])
+        # an entry from the old score system that carried a tier keeps it,
+        # and starts at that tier's XP floor
+        self.assertAlmostEqual(r["xp"], 0.0)
+        memory.RANKS_FILE.write_text(json.dumps(
+            {"8": {"score": 80, "tier": "⛵ Bosun"}}))
+        r = self.run_async(memory.get_rank(8))
+        self.assertEqual(r["tier"], "⛵ Bosun")
+        self.assertAlmostEqual(r["xp"], memory.xp_floor("⛵ Bosun"))
 
     # ---- user LTM ----
 

@@ -386,35 +386,56 @@ async def prune_topics() -> int:
     return before - len(store["channels"])
 
 
-# ---------------- ranks: nightly AI-judged crew standings ----------------
-
+# ---------------- ranks: XP ladder + nightly AI spark ----------------
+# The old system was AI-judged nightly on a 0-100 "score" — opaque, and the
+# roles flapped up and down on the model's mood. The redesign: XP is earned
+# deterministically (messages and reactions), tiers sit at fixed thresholds,
+# and the nightly model only hands a small SPARK bonus on top — it can never
+# demote anyone. The ladder absorbed the stray rank roles that had drifted
+# in over time (Crew, Research Diver, First Mate, Captain).
 TIERS = [
-    ("🪵 Landlubber", 0, 19),
-    ("🪝 Deckhand", 20, 39),
-    ("⚓ Sailor", 40, 59),
-    ("🧭 Navigator", 60, 74),
-    ("⛵ Bosun", 75, 89),
-    ("👑 Admiral", 90, 100),
+    ("🪵 Landlubber", 0),
+    ("🪝 Deckhand", 100),
+    ("🚢 Crew", 250),
+    ("⚓ Sailor", 500),
+    ("🧭 Navigator", 1000),
+    ("🔬 Research Diver", 1750),
+    ("⛵ Bosun", 2750),
+    ("🎖️ First Mate", 4000),
+    ("🚩 Captain", 6000),
+    ("👑 Admiral", 9000),
 ]
 RANKS_FILE = MEM_DIR / "ranks.json"
 
 
-def tier_for_score(score: float) -> str:
-    for name, lo, hi in TIERS:
-        if lo <= score <= hi:
-            return name
-    return TIERS[0][0]
+def tier_for_xp(xp: float) -> str:
+    """The tier a member with this much XP wears."""
+    tier = TIERS[0][0]
+    for name, threshold in TIERS:
+        if xp >= threshold:
+            tier = name
+    return tier
+
+
+def xp_floor(tier: str) -> float:
+    """The XP threshold at which a tier begins."""
+    for name, threshold in TIERS:
+        if name == tier:
+            return threshold
+    return 0.0
 
 
 async def get_rank(user_id: int) -> dict:
     async with _lock(f"r{user_id}"):
         store = _load(RANKS_FILE, {})
         r = store.get(str(user_id), {
-            "score": 0, "tier": TIERS[0][0], "since": time.time(),
+            "xp": 0, "tier": TIERS[0][0], "since": time.time(),
             "history": [], "last_eval": None, "last_reason": "",
         })
-        r.setdefault("score", 0)
+        # lazy migration from the old AI-score system: keep the tier they
+        # earned, place their XP at that tier's floor
         r.setdefault("tier", TIERS[0][0])
+        r.setdefault("xp", xp_floor(r["tier"]))
         r.setdefault("history", [])
         r.setdefault("last_eval", None)
         r.setdefault("last_reason", "")
