@@ -153,6 +153,8 @@ class AttachTests(unittest.TestCase):
         source.frames = frames
         source.sounding.return_value = sounding
         source.dead = False
+        source.mode = "pulse"
+        source.silent_frames = 0
         source.cleanup = mock.Mock()
         return source
 

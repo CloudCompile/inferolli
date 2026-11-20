@@ -872,6 +872,8 @@ class MusicCog(commands.Cog):
         vc.play(source)
         await asyncio.sleep(1.5)
         if source.frames and source.sounding():
+            log.info("audio attached: mode=%s frames=%d silent=%d",
+                     source.mode, source.frames, source.silent_frames)
             return None
         if source.frames == 0:
             source.cleanup()
