@@ -359,6 +359,58 @@ async def _play_artist(name: str, limit: int = 12) -> dict:
     return {"mode": "artist", "queued": queued, "total": len(rows)}
 
 
+def _tokens(text: str) -> list[str]:
+    import re
+    return [t for t in re.split(r"[^0-9a-z]+", (text or "").lower()) if len(t) > 1]
+
+
+def _soft_filter(rows: list[dict], query: str) -> list[dict]:
+    """Every query word appears somewhere in the row's name/artist.
+
+    People say "CJ's Station" for "CJ Hauser's Station" and "phonk playlist"
+    for "ACTUALLY GOOD PHONK" — a raw substring test misses both, and the
+    apostrophe alone would sink it.
+    """
+    wanted = _tokens(query)
+    if not wanted:
+        return list(rows)
+    out = []
+    for row in rows:
+        have = set(_tokens(f"{row.get('name') or ''} {row.get('artist') or ''}"))
+        if all(tok in have for tok in wanted):
+            out.append(row)
+    return out
+
+
+async def _resolve_text(query: str):
+    """Free text → the most likely thing to play.
+
+    Song first (that's what /play always meant) unless the text says
+    "station"/"radio" — then stations win, and the account's OWN stations come
+    before Apple's, since `/play cj's station` means CJ Hauser's Station and
+    catalog search has never heard of it.
+    """
+    wants_station = bool(set(_tokens(query)) & {"station", "radio"})
+    order = (["own", "stations", "songs", "playlists", "albums"] if wants_station
+             else ["songs", "own", "stations", "playlists", "albums"])
+    for step in order:
+        if step == "own":
+            try:
+                own = _soft_filter(await _station_list(), query)
+            except Exception:
+                own = []
+            if own:
+                return "stations", own[0]["id"], own[0]["name"]
+            continue
+        try:
+            rows = await _catalog_search(query, step, limit=3)
+        except Exception:
+            rows = []
+        if rows:
+            return step, rows[0]["id"], rows[0]["name"]
+    return None
+
+
 async def _start(kind: str, rid: str, label: str = "") -> dict:
     """Start playback for one normalized row."""
     if kind in ("songs", "song", "library-songs"):
@@ -548,6 +600,11 @@ async def _ac_play(interaction: discord.Interaction, current: str):
                 term, "songs,albums,playlists,stations", limit=4)
         except Exception:
             log.debug("play autocomplete: catalog search failed", exc_info=True)
+        try:
+            # the account's own stations never appear in catalog search
+            rows += _soft_filter(await _station_list(), term)[:3]
+        except Exception:
+            log.debug("play autocomplete: stations failed", exc_info=True)
     try:
         rows += _filter(await _library_playlists(), term)[:4]
     except Exception:
@@ -732,16 +789,16 @@ class MusicCog(commands.Cog):
         await interaction.response.defer()
         kind, rid = _decode(query)
         if kind is None:
-            # free text — best song match, exactly like the old /play
+            # free text — best song match, then a station/playlist by name
             try:
-                rows = await _catalog_search(query, "songs", limit=5)
+                found = await _resolve_text(query)
             except Exception as exc:
                 return await interaction.followup.send(
                     f"the studio didn't answer — {str(exc)[:120]}")
-            if not rows:
+            if not found:
                 return await interaction.followup.send(
                     f"couldn't find anything for “{query}”")
-            kind, rid = "songs", rows[0]["id"]
+            kind, rid, query = found
         try:
             embed = await self._run_play(interaction, kind, rid, query)
         except Exception as exc:
@@ -800,7 +857,7 @@ class MusicCog(commands.Cog):
         rows: list[dict] = []
         if query:
             try:
-                rows += _filter(await _station_list(), query)[:5]  # your own first
+                rows += _soft_filter(await _station_list(), query)[:5]  # your own first
             except Exception:
                 pass
             try:

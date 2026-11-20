@@ -236,6 +236,68 @@ class SongIdTests(unittest.TestCase):
             run(music._song_ids("stations", "ra.1"))
 
 
+class ResolveTextTests(unittest.TestCase):
+    """'/play cj's station' must land on the account's own station, not on a
+    song called CJ or a dead end."""
+
+    def _patch(self, songs, own=(), catalog=None):
+        async def search(term, types, limit=5):
+            if types == "songs":
+                return [{"kind": "songs", "id": f"s{i}", "name": n} for i, n in enumerate(songs)]
+            return [{"kind": types, "id": f"{types}0", "name": f"{types} hit"} for _ in [0]][:1] \
+                if (catalog is None or types in catalog) else []
+
+        async def stations(force=False):
+            return [{"kind": "stations", "id": i, "name": n} for i, n in own]
+
+        return mock.patch.multiple(
+            music,
+            _catalog_search=mock.Mock(side_effect=search),
+            _station_list=mock.Mock(side_effect=stations))
+
+    def test_song_wins_when_one_matches(self):
+        with self._patch(["Get Lucky"]):
+            self.assertEqual(run(music._resolve_text("get lucky")),
+                             ("songs", "s0", "Get Lucky"))
+
+    def test_own_station_beats_catalog_when_no_song_matches(self):
+        with self._patch([], own=[("ra.u-cj", "CJ Hauser’s Station")]):
+            self.assertEqual(run(music._resolve_text("cj's station")),
+                             ("stations", "ra.u-cj", "CJ Hauser’s Station"))
+
+    def test_falls_through_to_catalog_collection(self):
+        with self._patch([], catalog=["playlists"]):
+            kind, rid, _ = run(music._resolve_text("today's hits"))
+        self.assertEqual(kind, "playlists")
+
+    def test_nothing_found_returns_none(self):
+        with self._patch([], catalog=[]):
+            self.assertIsNone(run(music._resolve_text("zzzz")))
+
+    def test_the_word_station_makes_stations_win(self):
+        """'cj's station' must not land on a song that merely contains 'CJ'."""
+        with self._patch(["Wheels on the Bus (CJ's Praise Version)"],
+                         own=[("ra.u-cj", "CJ Hauser’s Station")]):
+            self.assertEqual(run(music._resolve_text("cj's station")),
+                             ("stations", "ra.u-cj", "CJ Hauser’s Station"))
+
+
+class SoftFilterTests(unittest.TestCase):
+    def test_apostrophes_and_extra_words_do_not_sink_a_match(self):
+        rows = [{"name": "CJ Hauser’s Station", "artist": ""},
+                {"name": "Holiday Hits", "artist": ""}]
+        got = music._soft_filter(rows, "CJ's Station")
+        self.assertEqual([r["name"] for r in got], ["CJ Hauser’s Station"])
+
+    def test_words_out_of_order_still_match(self):
+        rows = [{"name": "ACTUALLY GOOD PHONK", "artist": ""}]
+        self.assertEqual(len(music._soft_filter(rows, "good phonk")), 1)
+
+    def test_no_match_stays_no_match(self):
+        rows = [{"name": "Holiday Hits", "artist": ""}]
+        self.assertEqual(music._soft_filter(rows, "death metal"), [])
+
+
 class AutocompleteTests(unittest.TestCase):
     def test_nothing_when_studio_not_wired(self):
         with mock.patch.multiple(music, URL="", KEY=""):
@@ -256,6 +318,26 @@ class AutocompleteTests(unittest.TestCase):
         values = [c.value for c in out]
         self.assertIn("songs:1", values)
         self.assertIn("playlists:p.mine", values)
+
+    def test_play_autocomplete_offers_own_stations(self):
+        """Personal stations aren't in catalog search — autocomplete has to
+        pull them from the personal surface or '/play cj' misses them."""
+        async def search(term, types, limit=5):
+            return []
+
+        async def stations(force=False):
+            return [{"kind": "stations", "id": "ra.u-cj", "name": "CJ Hauser’s Station",
+                     "artist": ""}]
+
+        async def lib(force=False):
+            return []
+
+        with mock.patch.multiple(music, URL="http://x", KEY="k"), \
+             mock.patch.object(music, "_catalog_search", mock.Mock(side_effect=search)), \
+             mock.patch.object(music, "_station_list", mock.Mock(side_effect=stations)), \
+             mock.patch.object(music, "_library_playlists", mock.Mock(side_effect=lib)):
+            out = run(music._ac_play(mock.Mock(), "cj"))
+        self.assertIn("stations:ra.u-cj", [c.value for c in out])
 
     def test_autocomplete_failure_is_silent(self):
         async def boom(*a, **kw):
