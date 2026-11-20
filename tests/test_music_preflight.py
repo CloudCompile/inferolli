@@ -1,43 +1,128 @@
-"""cogs/music.py — the voice preflight must prove audio actually flows.
+"""cogs/music.py — the audio path, which has been wrong three ways.
 
-Two dead ends are recorded here, because both shipped and both left the bot
-sitting in a voice channel in total silence:
+Real failures this file pins, in order of discovery:
 
-1. The probe issued HEAD on the mp3 stream. tonearm's stream route has no HEAD
-   (405), so it always failed and /play never joined.
-2. The probe asked /api/audio/status for `running`. That flag is only true
-   while a listener is already attached — tonearm drops the pipeline when the
-   last one leaves — so on a first join it always read false.
+1. The preflight issued HEAD on the mp3 stream. tonearm's stream route has no
+   HEAD (405), so /play never joined a voice channel.
+2. The preflight then asked /api/audio/status for `running`. That flag is only
+   true while a listener is already attached — tonearm deletes its pipeline
+   when the last one leaves — so on a first join it always read false and the
+   bot sat in the channel, silent.
+3. The preflight then pulled bytes from the stream, which DID pass — and then
+   the probe's own disconnect called tonearm's unsubscribe(), which stops the
+   capture pipeline even when other listeners remain. It killed the audio
+   under the bot's freshly started ffmpeg. The bot played silence, and no
+   error was logged because ffmpeg exited cleanly on EOF.
 
-The fix is to pull a little of the real stream, which is exactly what ffmpeg
-is about to do. These tests pin that, including the silent-but-flowing case.
+So: read the studio's sink directly, and MEASURE. `isPlaying: true` cannot see
+a stalled Chromium whose sink has gone idle — that is exactly what happened.
 """
 
 import asyncio
 import unittest
 from unittest import mock
 
-import httpx
-
 from cogs import music
 from tests.fakes import FakeGuild, FakeMember
 
 
-class FakeStream:
-    """Stands in for httpx's streaming response object."""
+class FakeProc:
+    """Stand-in for the ffmpeg subprocess behind StudioAudio."""
 
-    def __init__(self, status=200, chunks=(b"x" * 8192,)):
-        self.status_code = status
-        self._chunks = chunks
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+        self.killed = False
+        self.stdout = self  # StudioAudio reads from proc.stdout
 
-    async def aiter_bytes(self):
-        for c in self._chunks:
-            yield c
+    def read(self, n):
+        if self._chunks:
+            return self._chunks.pop(0)
+        return b""
+
+    def kill(self):
+        self.killed = True
 
 
-class PreflightTests(unittest.TestCase):
+class StudioAudioTests(unittest.TestCase):
+    def _source(self, *chunks, device="tonearm_audio"):
+        proc = FakeProc(chunks)
+        with mock.patch.object(music.subprocess, "Popen", mock.Mock(return_value=proc)):
+            source = music.StudioAudio("http://studio/stream.mp3", device)
+        return source, proc
+
+    def test_real_audio_counts_as_sounding(self):
+        loud = b"\x01\x00" * (music.FRAME // 2)
+        source, proc = self._source(loud, loud)
+        source.read()
+        self.assertTrue(source.sounding())
+        self.assertEqual(source.silent_frames, 0)
+        self.assertEqual(source.mode, "pulse")
+
+    def test_digital_silence_is_not_sounding(self):
+        silence = b"\x00" * music.FRAME
+        source, _ = self._source(silence, silence, silence)
+        for _ in range(3):
+            source.read()
+        self.assertFalse(source.sounding())
+        self.assertAlmostEqual(source.silent_seconds(), 0.06)
+
+    def test_sound_after_silence_resets_the_counter(self):
+        silence = b"\x00" * music.FRAME
+        loud = b"\x01\x00" * (music.FRAME // 2)
+        source, _ = self._source(silence, silence, loud)
+        for _ in range(3):
+            source.read()
+        self.assertTrue(source.sounding())
+        self.assertEqual(source.silent_frames, 0)
+
+    def test_eof_marks_the_source_dead(self):
+        source, _ = self._source()
+        self.assertEqual(source.read(), b"")
+        self.assertTrue(source.dead)
+        self.assertFalse(source.sounding())
+
+    def test_cleanup_kills_ffmpeg(self):
+        source, proc = self._source()
+        source.cleanup()
+        self.assertTrue(proc.killed)
+
+    def test_http_fallback_when_there_is_no_sink(self):
+        with mock.patch.object(music.subprocess, "Popen", mock.Mock(return_value=FakeProc([]))) as popen:
+            music.StudioAudio("http://studio/stream.mp3", None)
+        args = popen.call_args[0][0]
+        self.assertIn("http://studio/stream.mp3", args)
+        self.assertNotIn("pulse", args)
+
+    def test_pulse_capture_reads_the_monitor(self):
+        with mock.patch.object(music.subprocess, "Popen", mock.Mock(return_value=FakeProc([]))) as popen:
+            music.StudioAudio("http://x", "tonearm_audio")
+        args = popen.call_args[0][0]
+        self.assertIn("pulse", args)
+        self.assertIn("tonearm_audio.monitor", args)
+        self.assertIn("-ac", args)
+        self.assertEqual(args[args.index("-ac") + 1], "2")
+        self.assertEqual(args[-1], "pipe:1")
+
+
+class SinkNameTests(unittest.TestCase):
+    def test_reads_the_first_sink(self):
+        done = mock.Mock(stdout="1\ttonearm_audio\tmodule-null-sink.c\ts16le\n")
+        with mock.patch.object(music.subprocess, "run", mock.Mock(return_value=done)):
+            self.assertEqual(music._sink_name(), "tonearm_audio")
+
+    def test_no_pulse_returns_none(self):
+        with mock.patch.object(music.subprocess, "run", mock.Mock(side_effect=FileNotFoundError)):
+            self.assertIsNone(music._sink_name())
+
+
+class AttachTests(unittest.TestCase):
+    """The bot must not claim success unless sound is actually flowing."""
+
     def run_async(self, coro):
         return asyncio.run(coro)
+
+    def _cog(self):
+        return music.MusicCog(bot=mock.Mock())
 
     def _interaction(self):
         guild = FakeGuild()
@@ -63,38 +148,72 @@ class PreflightTests(unittest.TestCase):
         guild.voice_client = vc
         return vc
 
-    def _ctx(self, probe):
-        return mock.patch.multiple(
-            music, URL="http://studio", KEY="k",
-            _stream_probe=mock.AsyncMock(return_value=probe))
+    def _source(self, sounding=True, frames=10):
+        source = mock.Mock(spec=music.StudioAudio)
+        source.frames = frames
+        source.sounding.return_value = sounding
+        source.dead = False
+        source.cleanup = mock.Mock()
+        return source
 
-    def test_live_stream_joins_and_plays(self):
+    def test_sound_flowing_means_joined(self):
         inter, guild, ch = self._interaction()
         vc = self._voice(guild, ch)
-        cog = music.MusicCog(bot=mock.Mock())
-        with self._ctx((True, None)), \
-             mock.patch.object(music.discord, "FFmpegPCMAudio", mock.Mock()), \
-             mock.patch.object(music.discord, "PCMVolumeTransformer", mock.Mock()):
+        cog = self._cog()
+        source = self._source()
+        with mock.patch.multiple(music, URL="http://studio", KEY="k"), \
+             mock.patch.object(music, "_new_source", mock.Mock(return_value=source)), \
+             mock.patch("asyncio.sleep", mock.AsyncMock()):
             got, why = self.run_async(cog._ensure_voice(inter))
         self.assertIs(got, vc)
         self.assertIsNone(why)
         vc.play.assert_called_once()
 
-    def test_dead_pump_means_no_voice_and_says_why(self):
+    def test_absolute_silence_is_refused_after_a_nudge(self):
         inter, guild, ch = self._interaction()
         vc = self._voice(guild, ch)
-        cog = music.MusicCog(bot=mock.Mock())
-        with self._ctx((False, "the studio's player is paused — run `/resume`")):
+        cog = self._cog()
+        silent = self._source(sounding=False)
+        with mock.patch.multiple(music, URL="http://studio", KEY="k"), \
+             mock.patch.object(music, "_new_source", mock.Mock(return_value=silent)), \
+             mock.patch.object(music, "_nudge_player", mock.AsyncMock(return_value="restarted the track")), \
+             mock.patch("asyncio.sleep", mock.AsyncMock()):
             got, why = self.run_async(cog._ensure_voice(inter))
         self.assertIsNone(got)
-        self.assertIn("paused", why)
-        vc.play.assert_not_called()
+        self.assertIn("still silent", why)
+        self.assertIn("bug on my side", why)
+        self.assertEqual(silent.cleanup.call_count, 2)
+
+    def test_nudge_that_works_is_accepted(self):
+        inter, guild, ch = self._interaction()
+        vc = self._voice(guild, ch)
+        cog = self._cog()
+        silent = self._source(sounding=False)
+        recovered = self._source(sounding=True)
+        with mock.patch.multiple(music, URL="http://studio", KEY="k"), \
+             mock.patch.object(music, "_new_source", mock.Mock(side_effect=[silent, recovered])), \
+             mock.patch.object(music, "_nudge_player", mock.AsyncMock(return_value="resumed the player")), \
+             mock.patch("asyncio.sleep", mock.AsyncMock()):
+            got, why = self.run_async(cog._ensure_voice(inter))
+        self.assertIs(got, vc)
+        self.assertIsNone(why)
+
+    def test_no_bytes_at_all_is_refused(self):
+        inter, guild, ch = self._interaction()
+        vc = self._voice(guild, ch)
+        cog = self._cog()
+        empty = self._source(sounding=False, frames=0)
+        with mock.patch.multiple(music, URL="http://studio", KEY="k"), \
+             mock.patch.object(music, "_new_source", mock.Mock(return_value=empty)), \
+             mock.patch("asyncio.sleep", mock.AsyncMock()):
+            got, why = self.run_async(cog._ensure_voice(inter))
+        self.assertIsNone(got)
+        self.assertIn("no audio to give", why)
 
     def test_no_voice_channel_is_explained(self):
         inter, guild, ch = self._interaction()
         inter.user.voice = None
-        cog = music.MusicCog(bot=mock.Mock())
-        got, why = self.run_async(cog._ensure_voice(inter))
+        got, why = self.run_async(self._cog()._ensure_voice(inter))
         self.assertIsNone(got)
         self.assertIn("voice channel", why)
 
@@ -102,121 +221,52 @@ class PreflightTests(unittest.TestCase):
         inter, guild, ch = self._interaction()
         vc = self._voice(guild, ch)
         vc.is_playing.return_value = True
-        cog = music.MusicCog(bot=mock.Mock())
-        probe = mock.AsyncMock(return_value=(True, None))
+        fresh = mock.Mock()
         with mock.patch.multiple(music, URL="http://studio", KEY="k",
-                                 _stream_probe=probe):
-            got, why = self.run_async(cog._ensure_voice(inter))
+                                 _new_source=fresh):
+            got, why = self.run_async(self._cog()._ensure_voice(inter))
         self.assertIs(got, vc)
         self.assertIsNone(why)
-        vc.play.assert_not_called()
-        probe.assert_not_awaited()
+        fresh.assert_not_called()
 
 
-class StreamProbeTests(unittest.TestCase):
-    """The probe must be honest about silence, not just about connectivity."""
-
+class NudgeTests(unittest.TestCase):
     def run_async(self, coro):
         return asyncio.run(coro)
 
-    def _client(self, stream):
-        client = mock.Mock()
-        client.stream = mock.Mock(return_value=_AsyncCtx(stream))
-        client.__aenter__ = mock.AsyncMock(return_value=client)
-        client.__aexit__ = mock.AsyncMock(return_value=False)
-        factory = mock.Mock()
-        factory.__aenter__ = mock.AsyncMock(return_value=client)
-        factory.__aexit__ = mock.AsyncMock(return_value=False)
-        return factory
+    def test_paused_player_is_resumed(self):
+        posted = []
 
-    def _probe(self, stream=None, np=None, exc=None):
-        async def get(path, **params):
-            if exc:
-                raise exc
-            return np or {}
+        async def get(path, **kw):
+            return {"isPlaying": False, "id": "123"}
 
-        patches = [mock.patch.multiple(music, URL="http://studio", KEY="k"),
-                   mock.patch.object(music, "_get", mock.Mock(side_effect=get))]
-        if stream is not None:
-            patches.append(mock.patch.object(music.httpx, "AsyncClient",
-                                             mock.Mock(return_value=self._client(stream))))
-        return patches
+        async def post(path, **kw):
+            posted.append(path)
+            return {}
 
-    def _run(self, stream=None, np=None, exc=None):
-        patches = self._probe(stream, np, exc)
-        for p in patches:
-            p.start()
-        try:
-            return self.run_async(music._stream_probe())
-        finally:
-            for p in reversed(patches):
-                p.stop()
+        with mock.patch.object(music, "_get", mock.Mock(side_effect=get)), \
+             mock.patch.object(music, "_post", mock.Mock(side_effect=post)):
+            self.assertEqual(self.run_async(music._nudge_player()), "resumed the player")
+        self.assertEqual(posted, ["/playback/play"])
 
-    def test_bytes_and_a_playing_player_is_a_go(self):
-        ok, why = self._run(FakeStream(), {"isPlaying": True})
-        self.assertTrue(ok)
-        self.assertIsNone(why)
+    def test_stalled_playing_track_is_restarted(self):
+        posted = []
 
-    def test_flowing_but_paused_is_refused_with_instructions(self):
-        ok, why = self._run(FakeStream(), {"isPlaying": False})
-        self.assertFalse(ok)
-        self.assertIn("/resume", why)
+        async def get(path, **kw):
+            return {"isPlaying": True, "id": "617154366"}
 
-    def test_empty_stream_is_refused(self):
-        ok, why = self._run(FakeStream(chunks=()), {"isPlaying": True})
-        self.assertFalse(ok)
-        self.assertIn("nothing", why)
+        async def post(path, **kw):
+            posted.append(path)
+            return {}
 
-    def test_http_error_is_refused_and_owned(self):
-        ok, why = self._run(FakeStream(status=502), {"isPlaying": True})
-        self.assertFalse(ok)
-        self.assertIn("502", why)
-        self.assertIn("my bug", why)
-
-    def test_unreachable_studio_is_refused(self):
-        client = mock.Mock()
-        client.stream = mock.Mock(side_effect=httpx.ConnectError("refused"))
-        client.__aenter__ = mock.AsyncMock(return_value=client)
-        client.__aexit__ = mock.AsyncMock(return_value=False)
-        factory = mock.Mock()
-        factory.__aenter__ = mock.AsyncMock(return_value=client)
-        factory.__aexit__ = mock.AsyncMock(return_value=False)
-        with mock.patch.multiple(music, URL="http://studio", KEY="k"), \
-             mock.patch.object(music, "_get", mock.AsyncMock(return_value={})), \
-             mock.patch.object(music.httpx, "AsyncClient", mock.Mock(return_value=factory)):
-            ok, why = self.run_async(music._stream_probe())
-        self.assertFalse(ok)
-        self.assertIn("isn't answering", why)
-
-    def test_unconfigured_studio_is_refused(self):
-        with mock.patch.multiple(music, URL="", KEY=""):
-            ok, why = self.run_async(music._stream_probe())
-        self.assertFalse(ok)
-        self.assertIn("isn't wired up", why)
-
-
-class _AsyncCtx:
-    def __init__(self, value):
-        self.value = value
-
-    async def __aenter__(self):
-        return self.value
-
-    async def __aexit__(self, *exc):
-        return False
-
-
-if __name__ == "__main__":
-    unittest.main()
+        with mock.patch.object(music, "_get", mock.Mock(side_effect=get)), \
+             mock.patch.object(music, "_post", mock.Mock(side_effect=post)):
+            self.assertIn("restarted", self.run_async(music._nudge_player()))
+        self.assertEqual(posted, ["/playback/play-song/617154366"])
 
 
 class SelfHealTests(unittest.TestCase):
-    """A stopped player while people are in the channel must be restarted —
-    silence that nobody notices is the worst failure mode."""
-
     def test_watcher_restarts_a_stopped_stream(self):
-        import asyncio
-
         guild = FakeGuild()
         vc = mock.Mock()
         vc.is_playing.return_value = False
@@ -230,10 +280,7 @@ class SelfHealTests(unittest.TestCase):
             restarts.append(client)
             return None
 
-        sleeps = []
-
         async def fake_sleep(_seconds):
-            sleeps.append(_seconds)
             guild.voice_client = None  # one pass, then leave the loop
 
         async def now_playing(path, **params):
@@ -247,3 +294,40 @@ class SelfHealTests(unittest.TestCase):
             asyncio.run(cog._np_watcher(guild))
 
         self.assertEqual(restarts, [vc])
+
+
+class CommandNameTests(unittest.TestCase):
+    def test_resume_uses_the_real_tonearm_command(self):
+        """tonearm accepts play|pause|toggle|next|previous — /resume used to
+        POST /playback/resume and 404."""
+        src = open("cogs/music.py").read()
+        self.assertIn('_simple_command(interaction, "play", "resumed', src)
+        self.assertNotIn('"resume", "resumed', src)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class PulseEnvTests(unittest.TestCase):
+    """A bot that cannot reach the studio's pulse daemon captures silence from
+    a *different* server — the sink looks fine and the audio is dead air."""
+
+    def test_runtime_dir_defaults_to_the_studios(self):
+        import os
+        env = {"PATH": "/usr/bin"}
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(music.os.path, "isdir", return_value=True):
+            self.assertEqual(music._pulse_env()["XDG_RUNTIME_DIR"], "/tmp/pulse-runtime")
+
+    def test_an_existing_runtime_dir_is_respected(self):
+        import os
+        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/tmp/mine"}, clear=True), \
+             mock.patch.object(music.os.path, "isdir", return_value=True):
+            self.assertEqual(music._pulse_env()["XDG_RUNTIME_DIR"], "/tmp/mine")
+
+    def test_missing_runtime_dir_is_not_invented(self):
+        import os
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(music.os.path, "isdir", return_value=False):
+            self.assertNotIn("XDG_RUNTIME_DIR", music._pulse_env())

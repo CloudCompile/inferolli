@@ -26,6 +26,7 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -332,48 +333,122 @@ async def _song_ids(kind: str, rid: str) -> list[str]:
 
 # ---------------------------------------------------------------- playback
 
-async def _stream_probe() -> tuple[bool, str | None]:
-    """Can we actually pull audio out of the studio right now?
+# 20 ms of 48 kHz stereo s16 — one Discord voice frame.
+FRAME = 3840
 
-    /audio/status is NOT the answer: its `running` flag is true only while a
-    listener is already attached (tonearm drops the pipeline when the last one
-    leaves), so on the first join it always reads false — gating on it left the
-    bot sitting in the voice channel, silent. Ask the stream itself instead,
-    the same URL and the same route ffmpeg is about to use.
 
-    A silent-but-flowing stream is the other failure (Apple paused), so the
-    player state is checked too: real bytes, and something actually playing.
+def _pulse_env() -> dict:
+    """Environment that can reach the studio's PulseAudio daemon.
+
+    start.sh gives tonearm an XDG_RUNTIME_DIR it can own (/tmp/pulse-runtime),
+    because /run/user/1000 does not exist in the sandbox — and a bot launched
+    without it reads a *different* (or no) daemon and captures silence.
     """
-    if not _configured():
-        return False, "the studio isn't wired up yet 🎧"
-    paused = False
+    env = dict(os.environ)
+    runtime = env.get("XDG_RUNTIME_DIR") or "/tmp/pulse-runtime"
+    if os.path.isdir(runtime):
+        env["XDG_RUNTIME_DIR"] = runtime
+    return env
+
+
+def _sink_name() -> str | None:
+    """The PulseAudio sink the studio plays into (tonearm_audio by default)."""
+    try:
+        out = subprocess.run(["pactl", "list", "short", "sinks"],
+                             capture_output=True, text=True, timeout=5,
+                             env=_pulse_env())
+        for line in (out.stdout or "").splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                return parts[1]
+    except Exception:
+        log.debug("no pactl — falling back to the HTTP stream", exc_info=True)
+    return None
+
+
+class StudioAudio(discord.AudioSource):
+    """The studio's live audio, read straight from its PulseAudio monitor.
+
+    Two reasons this is not the HTTP stream route:
+
+    1. tonearm's unsubscribe() stops the capture pipeline even when other
+       listeners remain, so ANY second client disconnecting (including a
+       preflight probe) kills the audio underneath the bot.
+    2. It lets the bot MEASURE what it sends. Silence is the failure people
+       actually hit, and a flag like isPlaying:true cannot see it — a stalled
+       Chromium reports playing while its sink goes idle.
+
+    The HTTP stream stays as a fallback for a studio on another machine.
+    """
+
+    def __init__(self, url: str = "", device: str | None = None):
+        self.frames = 0
+        self.silent_frames = 0
+        self.dead = False
+        self.mode = "pulse" if device else "http"
+        if device:
+            args = ["ffmpeg", "-nostdin", "-loglevel", "error",
+                    "-f", "pulse", "-i", f"{device}.monitor"]
+        else:
+            args = ["ffmpeg", "-nostdin", "-loglevel", "error", "-i", url]
+        args += ["-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"]
+        self._proc = subprocess.Popen(args, stdout=subprocess.PIPE,
+                                      stderr=subprocess.DEVNULL,
+                                      stdin=subprocess.DEVNULL,
+                                      env=_pulse_env() if device else None)
+
+    def read(self) -> bytes:
+        data = self._proc.stdout.read(FRAME)
+        if not data or len(data) < FRAME:
+            self.dead = True
+            return b""
+        self.frames += 1
+        if data.count(b"\x00") == len(data):
+            self.silent_frames += 1
+        else:
+            self.silent_frames = 0
+        return data
+
+    def is_opus(self) -> bool:
+        return False
+
+    def sounding(self) -> bool:
+        """Bytes flowing, and not all of them digital silence."""
+        return self.frames > 0 and self.silent_frames < self.frames
+
+    def silent_seconds(self) -> float:
+        return self.silent_frames * 0.02
+
+    def cleanup(self) -> None:
+        try:
+            self._proc.kill()
+        except Exception:
+            pass
+
+
+async def _nudge_player() -> str:
+    """Kick a stalled player. Returns a short description of what was tried."""
     try:
         np = await _get("/playback/now-playing")
-        paused = np.get("isPlaying") is False
     except Exception:
-        log.debug("stream probe: now-playing unavailable", exc_info=True)
+        return ""
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, read=8.0)) as c:
-            async with c.stream("GET", f"{URL}/api/audio/stream.mp3",
-                                params={"api_key": KEY}) as r:
-                if r.status_code >= 400:
-                    return False, (f"the studio's stream said HTTP {r.status_code} — "
-                                   f"that's my bug to fix, not yours")
-                got = 0
-                async for chunk in r.aiter_bytes():
-                    got += len(chunk)
-                    if got >= 8192:
-                        break
-    except Exception as exc:
-        log.warning("stream probe failed: %s", exc)
-        return False, ("the studio isn't answering yet — it takes a few seconds "
-                       "after boot; try again in a moment")
-    if got < 2048:
-        return False, ("the studio's audio pump sent nothing back — it's still "
-                       "starting up, try again in a moment")
-    if paused:
-        return False, "the studio's player is paused — run `/resume` and I'll stream it"
-    return True, None
+        if np.get("isPlaying") is False:
+            await _post("/playback/play")
+            return "resumed the player"
+        song = np.get("id")
+        if song:
+            await _post(f"/playback/play-song/{song}")
+            return "restarted the track"
+    except StudioError:
+        log.debug("nudge refused", exc_info=True)
+    return ""
+
+
+def _new_source() -> StudioAudio:
+    device = _sink_name()
+    url = f"{URL}/api/audio/stream.mp3?api_key={KEY}"
+    return StudioAudio(url, device)
 
 
 async def _queue_playlist_tracks(playlist_id: str, limit: int = 40) -> dict:
@@ -780,28 +855,54 @@ class MusicCog(commands.Cog):
             await vc.move_to(ch)
         if vc.is_playing():
             return vc, None
-        # Probe the pipeline by pulling a little of the exact URL ffmpeg will
-        # use. NOT /audio/status: its `running` flag is only true while a
-        # listener is already attached (tonearm drops the pipeline when the
-        # last one leaves), so gating on it meant the first join always
-        # "failed" — the bot sat in the channel, silent, forever.
+        # Attach and then check the audio itself. Every earlier version of this
+        # checked a flag instead — HEAD (no such route), then
+        # /audio/status.running (only true while someone already listens) —
+        # and each one left the bot sitting in the channel in silence.
         why = await self._start_stream(vc)
         if why:
             return None, why
         return vc, None
 
     async def _start_stream(self, vc) -> str | None:
-        """Probe, then attach the live stream. Returns why-not, or None on success."""
-        ok, why = await _stream_probe()
-        if not ok:
-            return why
-        player = discord.FFmpegPCMAudio(
-            f"{URL}/api/audio/stream.mp3?api_key={KEY}",
-            before_options=["-loglevel", "error"],
-            options="-vn")
-        vc.play(discord.PCMVolumeTransformer(player, volume=0.8),
-                after=lambda exc: log.warning("voice stream ended: %s", exc) if exc else None)
-        return None
+        """Attach the studio's audio and confirm sound flows. None on success."""
+        if not _configured():
+            return "the studio isn't wired up yet 🎧"
+        source = await asyncio.to_thread(_new_source)
+        vc.play(source)
+        await asyncio.sleep(1.5)
+        if source.frames and source.sounding():
+            return None
+        if source.frames == 0:
+            source.cleanup()
+            self._stop_voice(vc)
+            return ("the studio has no audio to give right now — it's either still "
+                    "starting up or Apple has nothing loaded; try again in a few "
+                    "seconds")
+        # Bytes but digital silence: Chromium has stalled (a track that "plays"
+        # forever with an idle sink). Nudge it and listen again.
+        tried = await _nudge_player()
+        source.cleanup()
+        self._stop_voice(vc)
+        source = await asyncio.to_thread(_new_source)
+        vc.play(source)
+        await asyncio.sleep(1.5)
+        if source.frames and source.sounding():
+            log.info("studio was silent — %s and the sound came back", tried or "retried")
+            return None
+        source.cleanup()
+        self._stop_voice(vc)
+        return ("the studio is silent: it says it's playing but no sound is coming "
+                "out. i restarted its player and it's still silent, so this is a "
+                "bug on my side, not yours")
+
+    @staticmethod
+    def _stop_voice(vc) -> None:
+        try:
+            if vc.is_playing():
+                vc.stop()
+        except Exception:
+            pass
 
     async def _np_watcher(self, guild: discord.Guild):
         """While a voice party is live: post track changes, and keep the audio up.
@@ -827,7 +928,10 @@ class MusicCog(commands.Cog):
                         await post.send(embed=_np_embed(np))
             except Exception:
                 log.debug("np watcher hiccup", exc_info=True)
-            if not vc.is_playing() and failures < 3:
+            source = getattr(vc, "source", None)
+            stalled = isinstance(source, StudioAudio) and (
+                source.dead or source.silent_seconds() >= 20)
+            if (not vc.is_playing() or stalled) and failures < 3:
                 why = await self._start_stream(vc)
                 if why:
                     failures += 1
@@ -1030,7 +1134,7 @@ class MusicCog(commands.Cog):
 
     @app_commands.command(name="resume", description="Resume the music")
     async def resume(self, interaction: discord.Interaction):
-        await self._simple_command(interaction, "resume", "resumed ▶")
+        await self._simple_command(interaction, "play", "resumed ▶")
 
     @app_commands.command(name="queue", description="See what's queued")
     async def queue(self, interaction: discord.Interaction):
