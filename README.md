@@ -22,6 +22,12 @@ AI-powered Discord bot for **setting up servers**, **AI automod**, and
   conversations using the last few messages as context, plus AI welcomes for
   new members. Rate-limited per channel.
 - **`/ask`** — one-off AI questions, **`/config`** — per-server toggles.
+- **Music** — it's the DJ: `/play` (songs, albums, playlists, stations — with
+  autocomplete over the Apple catalog, the library, and the account's personal
+  stations), `/search`, `/station`, `/playlist`, and streaming into voice
+  channels via tonearm, which drives a logged-in Apple Music account from
+  inside its own sandbox. It creates playlists and edits **only the ones it
+  created**; playlists that were already in the library are read-only to it.
 
 ## Setup
 
@@ -94,7 +100,7 @@ the **staff** tier, server-structure changes require **admin** — see
 The suite is hermetic — no Discord, no network, no credentials:
 
 ```bash
-python -m unittest discover -s tests    # 228 tests, ~0.3s
+python -m unittest discover -s tests    # 478 tests, ~0.5s
 ```
 
 CI runs it on Python 3.11 and 3.12, plus a credential scan of tracked files and

@@ -107,6 +107,41 @@ Tiers come from `config.json` (`permissions`), so what a role may do is a
 config decision rather than a hardcoded check. Every action declares its
 minimum tier; anything unlisted defaults to admin.
 
+## Music
+
+The bot is the server's DJ. `tonearm` — a studio for the user's own logged-in
+Apple Music account — runs **inside the same sandbox**, launched by `start.sh`
+with `TONEARM_AUDIO=1 TONEARM_ENABLE_WRITES=1` on `127.0.0.1:8188`, so `/play`
+never dials a box that has gone stale. It is also pulled up by the watchdog if
+it dies, and `cogs/backup.py` snapshots its logged-in session with the cortex.
+
+| Surface | What it does |
+|---|---|
+| `/play <anything>` | a song, album, playlist or station; autocompletes across the catalog **and** the library, incl. the account's personal stations |
+| `/search <q> [kind]` | songs / albums / playlists / stations / artists, then pick one to play |
+| `/station [q]` | personal stations (CJ's Station, Discovery Station…) — these exist only in the personal endpoints, not catalog search — plus Apple's |
+| `/playlist list show play new add remove rename delete` | see below |
+
+Voice audio is a live MP3 stream of that player (`discord.FFmpegPCMAudio`);
+track changes are posted to `#listening-post` while a party is running.
+
+**The ownership rule.** The bot creates playlists and edits **only those**
+(`data/music.json` is the ledger). A playlist that was already in the library
+is read-only to it: it can play and search it, never change it, and it says so
+plainly instead of failing halfway. This is enforced in code, not in the
+persona prompt, and the persona is told the same rule so it never claims
+otherwise.
+
+Two implementation details worth keeping:
+
+- MusicKit refuses a whole-library-playlist `setQueue` on this Chromium
+  (`mk-140 CONTENT_UNSUPPORTED`) even when every track plays alone, so playing
+  a library playlist falls back to `play-song` + `play-later` per track,
+  skipping unavailable tracks rather than sinking the whole queue.
+- Apple applies deletes asynchronously (204 now, out of the index moments
+  later), and leaves nameless tombstones behind, so the library walk pages
+  past 100, filters empties, and verifies deletes before reporting them.
+
 ## Persistence and failure
 
 The bot lives in one E2B sandbox (`scripts/e2b_launch.py`). Because E2B pauses
