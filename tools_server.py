@@ -14,6 +14,8 @@ import json
 import logging
 import os
 import re
+import shlex
+import shutil
 
 import discord
 import httpx
@@ -381,13 +383,30 @@ async def run_tool(bot, name: str, args: dict) -> str:
                                     env="COMPUTER_TOOL_ENABLED"):
                 return "(computer access disabled)"
             prompt = str(args.get("prompt", ""))[:500]
+            # /workspace only exists inside the sandbox. Running the command
+            # anyway made sh answer "can't cd to /workspace", which the model
+            # then narrated as a mysterious failure ("my computer tool keeps
+            # dying on a cd /workspace") instead of the plain fact: there is
+            # no sandbox. Say that, and execute nothing.
+            workspace = os.environ.get("COMPUTER_WORKSPACE", "/workspace")
+            if not os.path.isdir(workspace):
+                return (f"(no sandbox: nothing at {workspace}, so i didn't run "
+                        "anything. i can only use my computer while my sandbox is up)")
+            if not shutil.which("opencode"):
+                return ("(no sandbox: `opencode` isn't on PATH here, so i didn't "
+                        "run anything. i can only use my computer inside my sandbox)")
             import subprocess
+            cmd = (f"cd {shlex.quote(workspace)} && timeout 90 opencode run "
+                   f"{shlex.quote(prompt)}")
             r = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: subprocess.run(
-                    f"cd /workspace && timeout 90 opencode run '{prompt.replace(chr(39), chr(39) * 6)}'",
-                    shell=True, capture_output=True, text=True, timeout=110))
-            return ((r.stdout or "") + (("\n[stderr] " + r.stderr) if r.stderr.strip() else "")
-                    ).strip()[:1200] or "(no output)"
+                    ["bash", "-lc", cmd], capture_output=True, text=True,
+                    timeout=110))
+            out = (r.stdout or "").strip()
+            if not out:
+                why = (r.stderr or "").strip()[:200] or f"exit {r.returncode}"
+                return f"(the sandbox ran nothing for me: {why})"
+            return out[:1200]
         return f"(unknown tool: {name})"
     except Exception as e:
         return f"(tool {name} failed: {str(e)[:80]})"
