@@ -1,21 +1,33 @@
 """Music cog — Inferolli as the server's DJ, powered by tonearm.
 
-tonearm (a separate E2B sandbox) drives the user's own logged-in Apple Music
-web player and exposes it as a REST API + live audio streams. This cog gives
-the server:
+tonearm drives the user's own logged-in Apple Music account and exposes it as a
+REST API plus live audio streams. The studio runs INSIDE this sandbox
+(start.sh launches it), so /play never dials a stale box.
 
-  /play <query>   search Apple Music, start playback, join your voice channel
-                  if you're in one — instant listening party
-  /np             what's playing right now (artwork, lyrics snippet)
-  /skip /pause /resume /queue /volume
-  /party          join your voice channel and stream the session live
+  /play <song|album|playlist|station>  search and play — autocomplete covers
+                                       catalog songs/albums/playlists/stations
+                                       AND the playlists already in the library
+  /search <query>                      browse results by kind, pick one to play
+  /station [query]                     your own stations (CJ's Station,
+                                       Discovery Station…) plus Apple's catalog
+  /playlist list|show|play|new|add|remove|rename|delete
+                                       the bot CREATES and EDITS its own
+                                       playlists only. Playlists that were
+                                       already in the library are read-only to
+                                       it BY DESIGN — it can play and search
+                                       them, never change them.
+  /np /skip /pause /resume /queue /volume /party
 
 While a voice party is active, track changes are posted to the
 🎧│listening-post channel (auto-created by admins via abilities).
 """
 
+import asyncio
+import json
 import logging
 import os
+import time
+from pathlib import Path
 
 import discord
 from discord import app_commands
@@ -31,6 +43,32 @@ LISTENING_POST = "listening-post"
 
 COLOUR = 0xFA243C  # apple music red
 
+# playlist create drives Apple's UI automation — the server documents up to
+# ~2 minutes before it returns. Never time out early: a timed-out client can't
+# see the id of a playlist the server goes on to create.
+CREATE_TIMEOUT = 200.0
+WRITE_TIMEOUT = 90.0
+
+# what the bot made (and may therefore edit). Apple is the source of truth for
+# the playlists themselves; this file is the ownership ledger.
+STATE_FILE = Path(__file__).parent.parent / "data" / "music.json"
+
+LIB_CACHE_TTL = 60.0
+STATION_CACHE_TTL = 300.0
+
+EMOJI = {"songs": "🎵", "albums": "💿", "playlists": "📃",
+         "stations": "📻", "artists": "🎤"}
+KIND_WORD = {"songs": "song", "albums": "album", "playlists": "playlist",
+             "stations": "station", "artists": "artist"}
+
+PLAYABLE = {"songs", "song", "albums", "album", "playlists", "playlist",
+            "stations", "station", "artists", "library-playlists",
+            "library-albums", "library-songs"}
+
+
+class StudioError(RuntimeError):
+    """tonearm refused — the message is safe to show a person."""
+
 
 def _configured() -> bool:
     return bool(URL and KEY)
@@ -40,19 +78,311 @@ def _headers() -> dict:
     return {"Authorization": f"Bearer {KEY}"}
 
 
+def _friendly(status: int, body) -> str:
+    """tonearm's error envelope → one line a person can act on."""
+    try:
+        d = json.loads(body) if isinstance(body, (str, bytes)) else body
+    except Exception:
+        d = None
+    if isinstance(d, dict):
+        err = d.get("error")
+        if isinstance(err, dict):
+            code = str(err.get("code") or "")
+            if code == "writes_disabled":
+                return ("the studio has writes switched off, so it can't change "
+                        "playlists right now")
+            msg = err.get("message") or err.get("hint") or code
+            if msg:
+                return str(msg)[:180]
+        if d.get("detail"):
+            return str(d["detail"])[:180]
+    txt = body.decode() if isinstance(body, bytes) else str(body)
+    return f"HTTP {status}: {txt[:160]}"
+
+
+async def _request(method: str, path: str, *, params: dict | None = None,
+                   body=None, timeout: float = 20.0) -> dict:
+    clean = {k: v for k, v in (params or {}).items() if v is not None}
+    async with httpx.AsyncClient(timeout=timeout) as c:
+        r = await c.request(method, f"{URL}/api{path}", headers=_headers(),
+                            params=clean or None, json=body)
+    if r.status_code >= 400:
+        raise StudioError(_friendly(r.status_code, r.text))
+    if not r.content:
+        return {}
+    try:
+        return r.json()
+    except Exception:
+        return {}
+
+
 async def _get(path: str, **params) -> dict:
-    async with httpx.AsyncClient(timeout=20.0) as c:
-        r = await c.get(f"{URL}/api{path}", headers=_headers(), params=params)
-        r.raise_for_status()
-        return r.json()
+    return await _request("GET", path, params=params)
 
 
-async def _post(path: str) -> dict:
-    async with httpx.AsyncClient(timeout=20.0) as c:
-        r = await c.post(f"{URL}/api{path}", headers=_headers())
-        r.raise_for_status()
-        return r.json()
+async def _post(path: str, **params) -> dict:
+    return await _request("POST", path, params=params)
 
+
+# ---------------------------------------------------------------- ownership
+
+def _load_state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def _save_state(state: dict) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=1, sort_keys=True))
+
+
+def owned() -> dict:
+    """{playlist_id: {"name", "by", "at"}} — playlists the bot created."""
+    return _load_state().get("playlists", {}) or {}
+
+
+def is_owned(playlist_id: str) -> bool:
+    return bool(playlist_id) and playlist_id in owned()
+
+
+def mark_owned(playlist_id: str, name: str, by) -> None:
+    st = _load_state()
+    st.setdefault("playlists", {})[playlist_id] = {
+        "name": name, "by": str(by), "at": int(time.time())}
+    _save_state(st)
+
+
+def unmark_owned(playlist_id: str) -> None:
+    st = _load_state()
+    (st.get("playlists") or {}).pop(playlist_id, None)
+    _save_state(st)
+
+
+def not_owned_message(name: str) -> str:
+    return (f"**{name}** is one of yours, not mine — I only edit playlists I "
+            f"created, so I can never wreck one you built. I can play it, "
+            f"search it, and add it to a queue; if you want changes, make a "
+            f"new one with `/playlist new`.")
+
+
+# ---------------------------------------------------------------- rows
+
+def _row(kind: str, r: dict) -> dict:
+    """Normalize any tonearm row (already flat, but tolerate raw Apple)."""
+    r = r or {}
+    attrs = r.get("attributes") or {}
+    art = r.get("artwork") or attrs.get("artwork")
+    url = art.get("url") if isinstance(art, dict) else art
+    name = r.get("name") or attrs.get("name") or r.get("title") or "?"
+    artist = r.get("artist") or attrs.get("artistName") or ""
+    return {
+        "kind": kind,
+        "id": r.get("id") or r.get("catalog_id") or "",
+        "library_id": r.get("library_id") or r.get("id") or "",
+        "catalog_id": r.get("catalog_id") or "",
+        "name": name,
+        "artist": artist,
+        "artwork": url,
+        "duration_ms": r.get("duration_ms") or attrs.get("durationInMillis"),
+    }
+
+
+def _label(row: dict) -> str:
+    label = f"{EMOJI.get(row['kind'], '•')} {row['name']}"
+    if row.get("artist"):
+        label += f" — {row['artist']}"
+    return label[:100]
+
+
+def _choices(rows: list[dict], limit: int = 25) -> list[app_commands.Choice[str]]:
+    out = []
+    for row in rows[:limit]:
+        label = _label(row) + (" ·mine" if is_owned(row["id"]) else "")
+        out.append(app_commands.Choice(
+            name=label[:100], value=f"{row['kind']}:{row['id']}"[:100]))
+    return out
+
+
+def _decode(value: str):
+    """Autocomplete values are '<kind>:<id>'; free text has no known kind."""
+    kind, sep, rid = (value or "").partition(":")
+    if sep and rid and kind in PLAYABLE:
+        return kind, rid
+    return None, None
+
+
+# ---------------------------------------------------------------- lookups
+
+async def _catalog_search(term: str, types: str, limit: int = 5) -> list[dict]:
+    res = await _get("/catalog/search", term=term, types=types, limit=limit)
+    rows = []
+    for kind, items in (res or {}).items():
+        for item in items or []:
+            rows.append(_row(kind, item))
+    return rows
+
+
+_library_cache = {"at": 0.0, "rows": []}
+
+
+async def _library_playlists(force: bool = False) -> list[dict]:
+    now = time.monotonic()
+    if not force and _library_cache["rows"] and now - _library_cache["at"] < LIB_CACHE_TTL:
+        return _library_cache["rows"]
+    # Apple pages this 100 at a time and the account already has more than
+    # that — stopping at page one made brand-new playlists invisible (the
+    # library list is alphabetical, so a fresh "Inferolli mix" sorted off the
+    # end). Walk the pages; 1000 is a sanity ceiling, not a limit anyone hits.
+    rows, offset = [], 0
+    for _ in range(10):
+        res = await _get("/library/playlists", limit=100, offset=offset)
+        batch = res.get("items") or []
+        rows.extend(_row("playlists", r) for r in batch)
+        if len(batch) < 100:
+            break
+        offset += 100
+    # Apple keeps nameless tombstones around right after a delete and the
+    # index carries a few managed shells — they are not playlists anyone can
+    # open, so don't offer them.
+    rows = [r for r in rows if (r.get("name") or "").strip()]
+    _library_cache.update(at=now, rows=rows)
+    return rows
+
+
+def _forget_library_cache() -> None:
+    _library_cache.update(at=0.0, rows=[])
+
+
+_station_cache = {"at": 0.0, "rows": []}
+
+
+async def _station_list(force: bool = False) -> list[dict]:
+    """Stations Apple builds for THIS account.
+
+    They exist only in the personal surfaces — "CJ's Station" is not in the
+    catalog and no search returns it. Recommendations + recently-played both
+    carry `ra.` items; union them, keep the first name we see.
+    """
+    now = time.monotonic()
+    if not force and _station_cache["rows"] and now - _station_cache["at"] < STATION_CACHE_TTL:
+        return _station_cache["rows"]
+    raw = []
+    try:
+        rec = await _get("/personal/recommendations")
+        for group in rec.get("groups") or []:
+            raw.extend(group.get("items") or [])
+    except Exception:
+        log.debug("station list: recommendations unavailable", exc_info=True)
+    try:
+        played = await _get("/personal/recently-played", limit=30)
+        raw.extend(played.get("items") or [])
+    except Exception:
+        log.debug("station list: recently-played unavailable", exc_info=True)
+    rows, seen = [], set()
+    for item in raw:
+        rid = str((item or {}).get("id") or "")
+        if not rid.startswith("ra.") or rid in seen:
+            continue
+        seen.add(rid)
+        rows.append(_row("stations", item))
+    _station_cache.update(at=now, rows=rows)
+    return rows
+
+
+async def _playlist_tracks(playlist_id: str) -> list[dict]:
+    res = await _get(f"/library/playlists/{playlist_id}/tracks")
+    return res.get("tracks") or []
+
+
+async def _song_ids(kind: str, rid: str) -> list[str]:
+    """Catalog song ids for a song, or every track of an album / playlist."""
+    if kind in ("songs", "song", "library-songs"):
+        return [rid]
+    if kind in ("albums", "album", "library-albums"):
+        path = (f"/library/albums/{rid}/tracks" if rid.startswith("l.")
+                else f"/catalog/albums/{rid}/tracks")
+    elif kind in ("playlists", "playlist", "library-playlists"):
+        path = (f"/library/playlists/{rid}/tracks" if rid.startswith("p.")
+                else f"/catalog/playlists/{rid}/tracks")
+    else:
+        raise StudioError(f"can't pull tracks out of a {kind}")
+    res = await _get(path)
+    rows = res.get("tracks") or res.get("items") or []
+    ids = [(r.get("catalog_id") or r.get("id")) for r in rows]
+    return [str(i) for i in ids if i]
+
+
+# ---------------------------------------------------------------- playback
+
+async def _queue_playlist_tracks(playlist_id: str, limit: int = 40) -> dict:
+    """Play a library playlist by building the queue one track at a time.
+
+    MusicKit refuses a whole-library-playlist setQueue on some builds
+    (`mk-140 CONTENT_UNSUPPORTED`) even when every track plays fine alone, and
+    one unavailable track poisons the whole list. Playing the first song and
+    appending the rest skips the duds instead of failing the playlist.
+    """
+    tracks = await _playlist_tracks(playlist_id)
+    if not tracks:
+        raise StudioError("that playlist is empty")
+    first = tracks[0]
+    await _post(f"/playback/play-song/{first.get('catalog_id') or first.get('id')}")
+    queued = skipped = 0
+    for track in tracks[1:limit]:
+        sid = track.get("catalog_id") or track.get("id")
+        if not sid:
+            skipped += 1
+            continue
+        try:
+            await _post("/playback/play-later", catalog_id=sid)
+            queued += 1
+        except StudioError:
+            skipped += 1  # unavailable in this storefront — keep going
+    return {"mode": "playlist", "queued": queued, "skipped": skipped,
+            "total": len(tracks)}
+
+
+async def _play_artist(name: str, limit: int = 12) -> dict:
+    rows = await _catalog_search(name, "songs", limit=limit)
+    if not rows:
+        raise StudioError(f"nothing by {name}")
+    await _post(f"/playback/play-song/{rows[0]['id']}")
+    queued = 0
+    for row in rows[1:]:
+        try:
+            await _post("/playback/play-later", catalog_id=row["id"])
+            queued += 1
+        except StudioError:
+            continue
+    return {"mode": "artist", "queued": queued, "total": len(rows)}
+
+
+async def _start(kind: str, rid: str, label: str = "") -> dict:
+    """Start playback for one normalized row."""
+    if kind in ("songs", "song", "library-songs"):
+        await _post(f"/playback/play-song/{rid}")
+        return {"mode": "song"}
+    if kind in ("artists",):
+        return await _play_artist(label or rid)
+    collection = {"albums": "album", "album": "album", "library-albums": "album",
+                  "playlists": "playlist", "playlist": "playlist",
+                  "library-playlists": "playlist",
+                  "stations": "station", "station": "station"}.get(kind)
+    if not collection:
+        raise StudioError(f"i don't know how to play a {kind}")
+    try:
+        await _post("/playback/play-collection", kind=collection, id=rid)
+        return {"mode": collection}
+    except StudioError:
+        if collection != "playlist":
+            raise
+        # library playlists: whole-list setQueue is the fragile path → rebuild
+        return await _queue_playlist_tracks(rid)
+
+
+# ---------------------------------------------------------------- embeds
 
 def _np_embed(np: dict) -> discord.Embed:
     e = discord.Embed(
@@ -70,6 +400,212 @@ def _np_embed(np: dict) -> discord.Embed:
     return e
 
 
+def _results_embed(title: str, rows: list[dict], note: str = "") -> discord.Embed:
+    e = discord.Embed(title=title[:250], colour=COLOUR)
+    lines = []
+    for i, row in enumerate(rows[:25], 1):
+        artist = f" — {row['artist']}" if row.get("artist") else ""
+        mine = " ·mine" if is_owned(row["id"]) else ""
+        lines.append(f"`{i:>2}.` {EMOJI.get(row['kind'], '•')} **{row['name']}**{artist}{mine}")
+    e.description = "\n".join(lines) or "*nothing found*"
+    if note:
+        e.set_footer(text=note)
+    return e
+
+
+def _tracks_embed(playlist: dict, tracks: list[dict], page: int,
+                  per_page: int = 12) -> discord.Embed:
+    e = discord.Embed(title=f"📃 {playlist.get('name') or 'playlist'}"[:250],
+                      colour=COLOUR)
+    if playlist.get("artwork"):
+        e.set_thumbnail(url=playlist["artwork"])
+    start = page * per_page
+    lines = [f"`{i}.` **{t.get('name')}** — {t.get('artist') or ''}"
+             for i, t in enumerate(tracks[start:start + per_page], start + 1)]
+    e.description = "\n".join(lines) or "*empty — add something with `/playlist add`*"
+    pages = max(1, (len(tracks) + per_page - 1) // per_page)
+    owner = "mine to edit" if is_owned(playlist["id"]) else "yours — read-only for me"
+    e.set_footer(text=f"{len(tracks)} tracks · page {page + 1}/{pages} · {owner}")
+    return e
+
+
+# ---------------------------------------------------------------- views
+
+class Picker(discord.ui.View):
+    """One select menu — pick a row, hand it to `on_pick`."""
+
+    def __init__(self, rows: list[dict], on_pick, *, placeholder: str = "pick one"):
+        super().__init__(timeout=300)
+        self.rows = rows
+        self._on_pick = on_pick
+        options = []
+        for i, row in enumerate(rows[:25]):
+            desc = row.get("artist") or ("mine — editable" if is_owned(row["id"]) else "")
+            options.append(discord.SelectOption(
+                label=_label(row), value=str(i),
+                description=desc[:100] if desc else None,
+                emoji=EMOJI.get(row["kind"])))
+        select = discord.ui.Select(placeholder=placeholder[:150], options=options)
+        select.callback = self._picked
+        self.select = select
+        self.add_item(select)
+
+    async def _picked(self, interaction: discord.Interaction):
+        row = self.rows[int(self.select.values[0])]
+        await self._on_pick(interaction, row)
+
+
+class TrackView(discord.ui.View):
+    """A playlist's tracks, paged, with a play-all button."""
+
+    PER_PAGE = 12
+
+    def __init__(self, cog, playlist: dict, tracks: list[dict], page: int = 0):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.playlist = playlist
+        self.tracks = tracks
+        self.page = page
+        self._sync()
+
+    def _sync(self):
+        self.clear_items()
+        play = discord.ui.Button(style=discord.ButtonStyle.success, label="play all")
+        play.callback = self._play_all
+        self.add_item(play)
+        if self.page > 0:
+            prev = discord.ui.Button(style=discord.ButtonStyle.secondary, label="◀ back")
+            prev.callback = self._prev
+            self.add_item(prev)
+        if (self.page + 1) * self.PER_PAGE < len(self.tracks):
+            nxt = discord.ui.Button(style=discord.ButtonStyle.secondary, label="more ▶")
+            nxt.callback = self._next
+            self.add_item(nxt)
+
+    async def _play_all(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        try:
+            embed = await self.cog._run_play(
+                interaction, "playlists", self.playlist["id"], self.playlist.get("name", ""))
+        except Exception as exc:
+            return await interaction.followup.send(
+                f"couldn't play it — {str(exc)[:150]}", ephemeral=True)
+        await interaction.edit_original_response(embed=embed, view=None)
+
+    async def _prev(self, interaction: discord.Interaction):
+        self.page = max(0, self.page - 1)
+        self._sync()
+        await interaction.response.edit_message(
+            embed=_tracks_embed(self.playlist, self.tracks, self.page), view=self)
+
+    async def _next(self, interaction: discord.Interaction):
+        self.page += 1
+        self._sync()
+        await interaction.response.edit_message(
+            embed=_tracks_embed(self.playlist, self.tracks, self.page), view=self)
+
+
+class Confirm(discord.ui.View):
+    def __init__(self, on_answer):
+        super().__init__(timeout=60)
+        self._on_answer = on_answer
+        yes = discord.ui.Button(style=discord.ButtonStyle.danger, label="delete it")
+        no = discord.ui.Button(style=discord.ButtonStyle.secondary, label="keep it")
+        yes.callback = self._yes
+        no.callback = self._no
+        self.add_item(yes)
+        self.add_item(no)
+
+    async def _yes(self, interaction: discord.Interaction):
+        for child in self.children:
+            child.disabled = True
+        await self._on_answer(interaction, True)
+
+    async def _no(self, interaction: discord.Interaction):
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="kept it 👍", view=self)
+
+
+# ---------------------------------------------------------------- autocomplete
+
+def _filter(rows: list[dict], current: str) -> list[dict]:
+    term = (current or "").strip().lower()
+    if not term:
+        return rows
+    return [r for r in rows if term in (r.get("name") or "").lower()
+            or term in (r.get("artist") or "").lower()]
+
+
+async def _ac_play(interaction: discord.Interaction, current: str):
+    if not _configured():
+        return []
+    term = (current or "").strip()
+    rows: list[dict] = []
+    if term:
+        try:
+            rows += await _catalog_search(
+                term, "songs,albums,playlists,stations", limit=4)
+        except Exception:
+            log.debug("play autocomplete: catalog search failed", exc_info=True)
+    try:
+        rows += _filter(await _library_playlists(), term)[:4]
+    except Exception:
+        log.debug("play autocomplete: library playlists failed", exc_info=True)
+    return _choices(rows)
+
+
+async def _ac_library_playlist(interaction: discord.Interaction, current: str):
+    if not _configured():
+        return []
+    try:
+        return _choices(_filter(await _library_playlists(), current))
+    except Exception:
+        return []
+
+
+async def _ac_owned_playlist(interaction: discord.Interaction, current: str):
+    """Only playlists the bot created can be edited, so only those autocomplete."""
+    if not _configured():
+        return []
+    rows = []
+    try:
+        library = {r["id"]: r for r in await _library_playlists()}
+    except Exception:
+        library = {}
+    term = (current or "").strip().lower()
+    for pid, meta in owned().items():
+        row = library.get(pid) or {"kind": "playlists", "id": pid,
+                                   "name": meta.get("name") or pid,
+                                   "artist": "", "artwork": None}
+        if term and term not in (row.get("name") or "").lower():
+            continue
+        rows.append(row)
+    # newest first — the one you just made is the one you want
+    rows.sort(key=lambda r: owned().get(r["id"], {}).get("at", 0), reverse=True)
+    return _choices(rows)
+
+
+async def _ac_add_source(interaction: discord.Interaction, current: str):
+    """Songs / albums / playlists you could add to one of the bot's playlists."""
+    if not _configured():
+        return []
+    term = (current or "").strip()
+    rows: list[dict] = []
+    if term:
+        try:
+            rows += await _catalog_search(term, "songs,albums,playlists", limit=4)
+        except Exception:
+            return []
+    try:
+        rows += _filter(await _library_playlists(), term)[:3]
+    except Exception:
+        pass
+    return _choices(rows)
+
+
+# ---------------------------------------------------------------- cog
+
 class MusicCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -80,9 +616,10 @@ class MusicCog(commands.Cog):
 
     async def _ensure_voice(self, interaction: discord.Interaction) -> discord.VoiceClient | None:
         """Join (or move to) the requester's voice channel and start the live stream."""
-        if not interaction.user.voice or not interaction.user.voice.channel:
+        user = getattr(interaction, "user", None)
+        if not user or not getattr(user, "voice", None) or not user.voice.channel:
             return None
-        ch = interaction.user.voice.channel
+        ch = user.voice.channel
         vc = interaction.guild.voice_client
         perms = ch.permissions_for(ch.guild.me)
         if vc is None or not vc.is_connected():
@@ -125,44 +662,171 @@ class MusicCog(commands.Cog):
                 log.debug("np watcher hiccup", exc_info=True)
             await discord.utils.sleep(20)
 
-    # ---------- commands ----------
+    # ---------- shared play plumbing ----------
 
-    @app_commands.command(name="play", description="Play something on the server's Apple Music")
+    async def _run_play(self, interaction: discord.Interaction, kind: str,
+                        rid: str, label: str = "") -> discord.Embed:
+        """Start playback, join voice if the asker is in a channel, describe it."""
+        summary = await _start(kind, rid, label)
+        await asyncio.sleep(1.2)  # let the player commit the new queue
+        np = {}
+        try:
+            np = await _get("/playback/now-playing")
+        except Exception:
+            log.debug("now-playing unavailable right after play", exc_info=True)
+        if not np.get("title"):
+            np = {"title": label or "queued", "artist": "", "isPlaying": True}
+        vc = None
+        try:
+            vc = await self._ensure_voice(interaction)
+        except Exception:
+            log.warning("voice join failed", exc_info=True)
+        bits = [KIND_WORD.get(kind, kind)]
+        if summary.get("skipped"):
+            bits.append(f"{summary['skipped']} unavailable track(s) skipped")
+        if summary.get("queued"):
+            bits.append(f"{summary['queued']} queued")
+        if vc:
+            bits.append(f"streaming into {vc.channel.mention}")
+        elif summary.get("mode") == "song":
+            bits.append("on the studio player")
+        embed = _np_embed(np)
+        embed.set_footer(text=" · ".join(bits))
+        if vc and interaction.guild and (self._np_task is None or self._np_task.done()):
+            self._np_task = self.bot.loop.create_task(self._np_watcher(interaction.guild))
+        return embed
+
+    async def _pick_and_play(self, interaction: discord.Interaction, row: dict):
+        """Select-menu callback: play the chosen row, collapse the picker."""
+        await interaction.response.defer()
+        try:
+            embed = await self._run_play(interaction, row["kind"], row["id"], row["name"])
+        except Exception as exc:
+            return await interaction.followup.send(
+                f"couldn't play that — {str(exc)[:150]}", ephemeral=True)
+        await interaction.edit_original_response(embed=embed, view=None)
+
+    async def _open_playlist(self, interaction: discord.Interaction, row: dict):
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+        try:
+            tracks = await _playlist_tracks(row["id"])
+        except Exception as exc:
+            return await interaction.followup.send(
+                f"couldn't read that playlist — {str(exc)[:150]}", ephemeral=True)
+        await interaction.edit_original_response(
+            embed=_tracks_embed(row, tracks, 0),
+            view=TrackView(self, row, tracks))
+
+    # ---------- playback commands ----------
+
+    @app_commands.command(
+        name="play",
+        description="Play a song, album, playlist or station (autocompletes as you type)")
+    @app_commands.describe(query="pick from the list, or just type whatever you want to hear")
+    @app_commands.autocomplete(query=_ac_play)
     async def play(self, interaction: discord.Interaction, query: str):
         if not _configured():
             return await interaction.response.send_message(
                 "the studio isn't wired up yet 🎧", ephemeral=True)
         await interaction.response.defer()
+        kind, rid = _decode(query)
+        if kind is None:
+            # free text — best song match, exactly like the old /play
+            try:
+                rows = await _catalog_search(query, "songs", limit=5)
+            except Exception as exc:
+                return await interaction.followup.send(
+                    f"the studio didn't answer — {str(exc)[:120]}")
+            if not rows:
+                return await interaction.followup.send(
+                    f"couldn't find anything for “{query}”")
+            kind, rid = "songs", rows[0]["id"]
         try:
-            res = await _get("/catalog/search", term=query, limit=5)
-        except Exception:
-            return await interaction.followup.send("the studio didn't answer — tonearm might be down")
-        songs = (res or {}).get("songs", [])
-        if not songs:
-            return await interaction.followup.send(f"couldn't find anything for “{query}”")
-        song = songs[0]
-        # rows come flat from tonearm ({name, artist, album, artwork,
-        # duration_ms, ...}) but tolerate raw nested catalog shapes too
-        attrs = song.get("attributes") or song
-        name = attrs.get("name") or attrs.get("title")
-        artist = attrs.get("artist") or attrs.get("artistName")
-        album = attrs.get("album") or attrs.get("albumName")
-        art = attrs.get("artwork")
-        artwork = art.get("url") if isinstance(art, dict) else art
-        dur = attrs.get("duration_ms") or attrs.get("durationMs")
-        try:
-            await _post(f"/playback/play-song/{song.get('catalog_id') or song.get('id')}")
-        except Exception as e:
-            return await interaction.followup.send(f"playback refused: {str(e)[:100]}")
-        vc = await self._ensure_voice(interaction)
-        where = f" — streaming into {vc.channel.mention} 🎧" if vc else " (on the studio player)"
+            embed = await self._run_play(interaction, kind, rid, query)
+        except Exception as exc:
+            return await interaction.followup.send(f"playback refused — {str(exc)[:150]}")
         await interaction.followup.send(
-            embed=_np_embed({"title": name, "artist": artist, "album": album or "",
-                             "artworkUrl": artwork, "isPlaying": True,
-                             "durationMs": dur, "elapsedMs": 0})
-            .set_footer(text=f"requested by {interaction.user.display_name}{where}"))
-        if vc and (self._np_task is None or self._np_task.done()):
-            self._np_task = self.bot.loop.create_task(self._np_watcher(interaction.guild))
+            embed=embed.set_footer(text=f"{embed.footer.text} · for {interaction.user.display_name}"))
+
+    @app_commands.command(name="search",
+                          description="Search Apple Music — songs, albums, playlists, stations, artists")
+    @app_commands.describe(query="what to look for", kind="narrow it down (default: everything)")
+    @app_commands.choices(kind=[
+        app_commands.Choice(name="everything", value="everything"),
+        app_commands.Choice(name="songs", value="songs"),
+        app_commands.Choice(name="albums", value="albums"),
+        app_commands.Choice(name="playlists", value="playlists"),
+        app_commands.Choice(name="stations", value="stations"),
+        app_commands.Choice(name="artists", value="artists"),
+    ])
+    async def search(self, interaction: discord.Interaction, query: str,
+                     kind: app_commands.Choice[str] = None):
+        if not _configured():
+            return await interaction.response.send_message(
+                "the studio isn't wired up yet 🎧", ephemeral=True)
+        await interaction.response.defer()
+        want = kind.value if kind else "everything"
+        types = ("songs,albums,playlists,stations,artists" if want == "everything" else want)
+        try:
+            rows = await _catalog_search(query, types, limit=6 if want == "everything" else 10)
+        except Exception as exc:
+            return await interaction.followup.send(
+                f"the studio didn't answer — {str(exc)[:120]}")
+        if want in ("everything", "playlists"):
+            try:
+                lib = (await _get("/library/search", term=query, limit=10)).get("playlists") or []
+                known = {r["id"] for r in rows}
+                rows += [_row("playlists", r) for r in lib if r.get("id") not in known]
+            except Exception:
+                log.debug("library playlist search failed", exc_info=True)
+        if not rows:
+            return await interaction.followup.send(f"nothing for “{query}” — try looser words")
+        rows = rows[:25]
+        embed = _results_embed(f"🔎 {query}", rows,
+                               note="pick one below to play it"
+                                    + (" · 📃 mine = a playlist I can edit"
+                                       if any(is_owned(r["id"]) for r in rows) else ""))
+        await interaction.followup.send(embed=embed, view=Picker(rows, self._pick_and_play))
+
+    @app_commands.command(name="station",
+                          description="Play a radio station — yours (CJ's Station, Discovery…) or Apple's")
+    @app_commands.describe(query="station to search for; leave empty for your own stations")
+    async def station(self, interaction: discord.Interaction, query: str = None):
+        if not _configured():
+            return await interaction.response.send_message(
+                "the studio isn't wired up yet 🎧", ephemeral=True)
+        await interaction.response.defer()
+        rows: list[dict] = []
+        if query:
+            try:
+                rows += _filter(await _station_list(), query)[:5]  # your own first
+            except Exception:
+                pass
+            try:
+                rows += await _catalog_search(query, "stations", limit=10)
+            except Exception as exc:
+                if not rows:
+                    return await interaction.followup.send(
+                        f"the studio didn't answer — {str(exc)[:120]}")
+        else:
+            try:
+                rows = await _station_list(force=True)
+            except Exception as exc:
+                return await interaction.followup.send(
+                    f"couldn't read your stations — {str(exc)[:120]}")
+        seen, unique = set(), []
+        for row in rows:
+            if row["id"] in seen:
+                continue
+            seen.add(row["id"])
+            unique.append(row)
+        if not unique:
+            return await interaction.followup.send(
+                "no stations came back — play something in Apple Music once and try again")
+        embed = _results_embed(f"📻 {query or 'your stations'}", unique,
+                               note="pick a station to start it")
+        await interaction.followup.send(embed=embed, view=Picker(unique, self._pick_and_play))
 
     @app_commands.command(name="np", description="What's playing right now")
     async def np(self, interaction: discord.Interaction):
@@ -240,6 +904,240 @@ class MusicCog(commands.Cog):
         except Exception as e:
             return await interaction.response.send_message(f"refused: {str(e)[:80]}", ephemeral=True)
         await interaction.response.send_message(ack, ephemeral=True)
+
+    # ---------- playlists ----------
+
+    playlist = app_commands.Group(name="playlist", description="Browse, play and (only my own) edit playlists")
+
+    @playlist.command(name="list", description="Every playlist in the library — searchable")
+    @app_commands.describe(query="filter by name")
+    async def pl_list(self, interaction: discord.Interaction, query: str = None):
+        if not _configured():
+            return await interaction.response.send_message("the studio isn't wired up yet 🎧", ephemeral=True)
+        await interaction.response.defer()
+        try:
+            rows = await _library_playlists(force=bool(query))
+        except Exception as exc:
+            return await interaction.followup.send(f"couldn't read your library — {str(exc)[:120]}")
+        if query:
+            rows = _filter(rows, query)
+        if not rows:
+            return await interaction.followup.send(
+                f"no playlists match “{query}”" if query else "the library has no playlists")
+        rows = rows[:25]
+        mine = sum(1 for r in rows if is_owned(r["id"]))
+        embed = _results_embed(
+            f"📃 {query or 'library playlists'}",
+            rows, note=f"{len(rows)} shown · {mine} editable by me · pick one to open it")
+        await interaction.followup.send(embed=embed, view=Picker(rows, self._open_playlist))
+
+    @playlist.command(name="show", description="See a playlist's tracks")
+    @app_commands.describe(name="which playlist")
+    @app_commands.autocomplete(name=_ac_library_playlist)
+    async def pl_show(self, interaction: discord.Interaction, name: str):
+        if not _configured():
+            return await interaction.response.send_message("the studio isn't wired up yet 🎧", ephemeral=True)
+        await interaction.response.defer()
+        kind, rid = _decode(name)
+        row = None
+        if kind:
+            try:
+                row = next((r for r in await _library_playlists() if r["id"] == rid), None)
+            except Exception:
+                row = None
+            row = row or {"id": rid, "name": rid, "kind": "playlists"}
+        if row is None:
+            try:
+                matches = _filter(await _library_playlists(), name)
+            except Exception as exc:
+                return await interaction.followup.send(f"couldn't read your library — {str(exc)[:120]}")
+            if not matches:
+                return await interaction.followup.send(f"no playlist called “{name}”")
+            row = matches[0]
+        await self._open_playlist(interaction, row)
+
+    @playlist.command(name="play", description="Play a whole playlist")
+    @app_commands.describe(name="which playlist")
+    @app_commands.autocomplete(name=_ac_library_playlist)
+    async def pl_play(self, interaction: discord.Interaction, name: str):
+        if not _configured():
+            return await interaction.response.send_message("the studio isn't wired up yet 🎧", ephemeral=True)
+        await interaction.response.defer()
+        kind, rid = _decode(name)
+        if kind is None:
+            try:
+                matches = _filter(await _library_playlists(), name)
+            except Exception as exc:
+                return await interaction.followup.send(f"couldn't read your library — {str(exc)[:120]}")
+            if not matches:
+                return await interaction.followup.send(f"no playlist called “{name}”")
+            kind, rid = "playlists", matches[0]["id"]
+        try:
+            embed = await self._run_play(interaction, kind, rid, name)
+        except Exception as exc:
+            return await interaction.followup.send(f"couldn't play it — {str(exc)[:150]}")
+        await interaction.followup.send(embed=embed)
+
+    @playlist.command(name="new", description="Create a playlist — I'll own it and can edit it")
+    @app_commands.describe(name="playlist name", description="optional blurb")
+    async def pl_new(self, interaction: discord.Interaction, name: str, description: str = ""):
+        if not _configured():
+            return await interaction.response.send_message("the studio isn't wired up yet 🎧", ephemeral=True)
+        await interaction.response.defer(thinking=True)
+        try:
+            res = await _request("POST", "/write/playlists",
+                                 params={"name": name, "description": description or ""},
+                                 timeout=CREATE_TIMEOUT)
+        except Exception as exc:
+            return await interaction.followup.send(
+                f"couldn't create it — {str(exc)[:150]}")
+        pid = (res or {}).get("playlist_id")
+        if not pid:
+            return await interaction.followup.send(
+                "the studio said okay but handed back no playlist id — check Apple "
+                "Music in a minute before re-running this")
+        mark_owned(pid, name, interaction.user.id)
+        _forget_library_cache()
+        embed = discord.Embed(title=f"📃 {name}", colour=COLOUR,
+                              description="created — it's mine to edit from here on")
+        embed.add_field(name="next", value="`/playlist add` a song, album or another playlist")
+        embed.set_footer(text=f"id {pid}")
+        await interaction.followup.send(embed=embed)
+
+    @playlist.command(name="add", description="Add a song, album or playlist to one of my playlists")
+    @app_commands.describe(playlist="one of my playlists", query="what to add — song, album or playlist")
+    @app_commands.autocomplete(playlist=_ac_owned_playlist, query=_ac_add_source)
+    async def pl_add(self, interaction: discord.Interaction, playlist: str, query: str):
+        if not _configured():
+            return await interaction.response.send_message("the studio isn't wired up yet 🎧", ephemeral=True)
+        await interaction.response.defer()
+        pid, pname = _decode(playlist)
+        if not pid or not is_owned(pid):
+            return await interaction.followup.send(
+                not_owned_message(pname or playlist), ephemeral=True)
+        kind, rid = _decode(query)
+        if kind is None:
+            try:
+                found = await _catalog_search(query, "songs,albums,playlists", limit=5)
+            except Exception as exc:
+                return await interaction.followup.send(f"couldn't search — {str(exc)[:120]}")
+            if not found:
+                return await interaction.followup.send(f"couldn't find “{query}” — pick from the autocomplete list")
+            kind, rid = found[0]["kind"], found[0]["id"]
+        try:
+            ids = await _song_ids(kind, rid)
+        except Exception as exc:
+            return await interaction.followup.send(f"couldn't list its tracks — {str(exc)[:150]}")
+        if not ids:
+            return await interaction.followup.send("that came back with no tracks to add")
+        note = ""
+        if len(ids) > 100:
+            note = f" (first 100 of {len(ids)})"
+            ids = ids[:100]
+        try:
+            await _request("POST", f"/write/playlists/{pid}/tracks",
+                           body=ids, timeout=WRITE_TIMEOUT)
+        except Exception as exc:
+            return await interaction.followup.send(f"couldn't add them — {str(exc)[:150]}")
+        _forget_library_cache()
+        await interaction.followup.send(
+            f"added **{len(ids)}** {KIND_WORD.get(kind, 'track')} track(s) to **{pname or query}**{note} 📃")
+
+    @playlist.command(name="remove", description="Drop a track from one of my playlists (by number)")
+    @app_commands.describe(playlist="one of my playlists", index="track number from /playlist show")
+    @app_commands.autocomplete(playlist=_ac_owned_playlist)
+    async def pl_remove(self, interaction: discord.Interaction, playlist: str,
+                        index: app_commands.Range[int, 1, 500]):
+        if not _configured():
+            return await interaction.response.send_message("the studio isn't wired up yet 🎧", ephemeral=True)
+        await interaction.response.defer()
+        pid, pname = _decode(playlist)
+        if not pid or not is_owned(pid):
+            return await interaction.followup.send(
+                not_owned_message(pname or playlist), ephemeral=True)
+        try:
+            tracks = await _playlist_tracks(pid)
+        except Exception as exc:
+            return await interaction.followup.send(f"couldn't read that playlist — {str(exc)[:150]}")
+        if not 1 <= index <= len(tracks):
+            return await interaction.followup.send(
+                f"**{pname}** has {len(tracks)} track(s) — pick 1–{len(tracks)}")
+        gone = tracks[index - 1]
+        keep = [t.get("library_id") or t.get("id")
+                for i, t in enumerate(tracks, 1) if i != index]
+        try:
+            await _request("PUT", f"/write/playlists/{pid}/tracks",
+                           body=[k for k in keep if k], timeout=WRITE_TIMEOUT)
+        except Exception as exc:
+            return await interaction.followup.send(f"couldn't remove it — {str(exc)[:150]}")
+        _forget_library_cache()
+        await interaction.followup.send(
+            f"removed **{gone.get('name')} — {gone.get('artist') or ''}** from **{pname}** 📃")
+
+    @playlist.command(name="rename", description="Rename one of my playlists")
+    @app_commands.describe(playlist="one of my playlists", name="the new name")
+    @app_commands.autocomplete(playlist=_ac_owned_playlist)
+    async def pl_rename(self, interaction: discord.Interaction, playlist: str, name: str):
+        if not _configured():
+            return await interaction.response.send_message("the studio isn't wired up yet 🎧", ephemeral=True)
+        await interaction.response.defer()
+        pid, pname = _decode(playlist)
+        if not pid or not is_owned(pid):
+            return await interaction.followup.send(
+                not_owned_message(pname or playlist), ephemeral=True)
+        try:
+            await _request("PATCH", f"/write/playlists/{pid}",
+                           params={"name": name}, timeout=WRITE_TIMEOUT)
+        except Exception as exc:
+            return await interaction.followup.send(f"couldn't rename it — {str(exc)[:150]}")
+        mark_owned(pid, name, interaction.user.id)
+        _forget_library_cache()
+        await interaction.followup.send(f"**{pname}** → **{name}** 📃")
+
+    @playlist.command(name="delete", description="Delete one of my playlists (asks first)")
+    @app_commands.describe(playlist="one of my playlists")
+    @app_commands.autocomplete(playlist=_ac_owned_playlist)
+    async def pl_delete(self, interaction: discord.Interaction, playlist: str):
+        if not _configured():
+            return await interaction.response.send_message("the studio isn't wired up yet 🎧", ephemeral=True)
+        pid, pname = _decode(playlist)
+        if not pid or not is_owned(pid):
+            return await interaction.response.send_message(
+                not_owned_message(pname or playlist), ephemeral=True)
+
+        async def answer(it: discord.Interaction, yes: bool):
+            if not yes:
+                return
+            await it.response.defer()
+            try:
+                await _request("DELETE", f"/write/playlists/{pid}", timeout=WRITE_TIMEOUT)
+            except Exception as exc:
+                return await it.followup.send(f"couldn't delete it — {str(exc)[:150]}")
+            unmark_owned(pid)
+            # Apple applies the delete async: it answers 204 immediately and
+            # the playlist drops out of the index a moment later. Give it a
+            # beat, then say which of the two actually happened.
+            gone = False
+            for _ in range(5):
+                await asyncio.sleep(2)
+                try:
+                    gone = all(r["id"] != pid for r in await _library_playlists(force=True))
+                except Exception:
+                    continue
+                if gone:
+                    break
+            if gone:
+                await it.edit_original_response(
+                    content=f"deleted **{pname}** — gone from the library 📃", view=None)
+            else:
+                await it.edit_original_response(
+                    content=(f"sent the delete for **{pname}** — Apple is still "
+                             f"syncing it, it'll drop off the library in a minute 📃"),
+                    view=None)
+
+        await interaction.response.send_message(
+            f"delete **{pname}**? it disappears from the Apple Music library too.",
+            view=Confirm(answer), ephemeral=True)
 
 
 async def setup(bot: commands.Bot):

@@ -65,6 +65,25 @@ class SelfKnowledgeTests(unittest.TestCase):
     def test_the_desktop_block_still_promises_it_can_act(self):
         self.assertIn("Never say you can't", companion.DESKTOP_BLOCK)
 
+    def test_it_knows_the_music_powers_it_has(self):
+        """It is the DJ for real: tonearm runs in its own sandbox. It must know
+        search/stations exist, and must know the edit rule — playlists it did
+        not create are read-only to it."""
+        block = companion.MUSIC_BLOCK
+        self.assertIn("/play", block)
+        self.assertIn("/search", block)
+        self.assertIn("/station", block)
+        self.assertIn("CJ's Station", block)
+        self.assertIn("/playlist", block)
+        self.assertIn("read-only", block)
+        self.assertIn("never change it", block)
+
+    def test_the_music_block_reaches_the_reply_prompt(self):
+        src = pathlib.Path("cogs/companion.py").read_text()
+        prompt_assembly = src[src.index("system = (_persona_prompt"):
+                             src.index("user = (f\"Recent messages")]
+        self.assertIn("MUSIC_BLOCK", prompt_assembly)
+
     def test_chromium_recipes_enable_software_gl(self):
         """There is no GPU in the sandbox. Chromium 156 blocklists WebGL without
         SwiftShader, so GPU pages (gd-webport died on this) render an error

@@ -81,6 +81,29 @@ DESKTOP_BLOCK = (
     "Your final message should be just the reply, never a progress report."
 )
 
+MUSIC_BLOCK = (
+    "\n\nMUSIC — you are the server's DJ and the gear is REAL. tonearm runs in "
+    "this sandbox driving a logged-in Apple Music account, so these work when "
+    "they're used (they're slash commands humans type; you can also hit the "
+    "studio API yourself — TONEARM_URL is in /bot/.env with its bearer key):\n"
+    "  /play <anything>      a song, album, playlist or station; it autocompletes "
+    "across the Apple catalog AND the playlists already in the library\n"
+    "  /search <query>       browse songs / albums / playlists / stations / "
+    "artists and pick one to play\n"
+    "  /station [query]      the account's OWN stations (CJ's Station, Discovery "
+    "Station, artist stations — these are not in catalog search) plus Apple's "
+    "catalog stations\n"
+    "  /playlist list|show|play|new|add|remove|rename|delete\n"
+    "      you can CREATE playlists and edit the ones you created. A playlist "
+    "that was already in the library is read-only to you — you can play it and "
+    "search it, never change it. If asked to edit one of theirs, say that "
+    "plainly and offer /playlist new; don't pretend you did it.\n"
+    "  /np /skip /pause /resume /queue /volume /party\n"
+    "Voice audio is a live stream of that player. If a channel is silent, the "
+    "studio's audio pump is down — that's a fixable bug, not a Discord "
+    "limitation, and never something to blame on the person asking.\n"
+)
+
 OUTBOX = "/workspace/outbox"
 OUTBOX_MAX_BYTES = 8 * 1024 * 1024      # default Discord upload cap
 OUTBOX_MAX_FILES = 3
@@ -546,6 +569,7 @@ class CompanionCog(commands.Cog):
                       + pulse_block
                       + SELF_BLOCK
                       + DESKTOP_BLOCK
+                      + MUSIC_BLOCK
                       + ("\n\nThey mentioned you directly. You can see the ongoing conversation below, "
                          "the WHOLE SERVER'S recent activity, and related conversations from other "
                          "channels — use them: if they ask what someone said, what's happening "

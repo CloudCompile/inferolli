@@ -136,8 +136,11 @@ start_tonearm() {
   # pulse needs a runtime dir it can OWN — /run/user/1000 doesn't exist in the
   # sandbox, and without it chrome plays to a dead daemon (digital silence)
   mkdir -p /tmp/pulse-runtime && chmod 700 /tmp/pulse-runtime 2>/dev/null
+  # ENABLE_WRITES lets /playlist create and edit the playlists the BOT made
+  # (the cog hard-refuses to touch any playlist it didn't create).
   ( cd "$TONearm_DIR" && XDG_RUNTIME_DIR=/tmp/pulse-runtime \
       TONEARM_AUDIO=1 TONEARM_CHROME_BIN=chromium TONEARM_PORT=8188 \
+      TONEARM_ENABLE_WRITES=1 \
       setsid nohup python3 -m tonearm >> /tmp/tonearm.log 2>&1 & )
   slog "tonearm: studio launched"
 }
