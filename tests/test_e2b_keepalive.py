@@ -16,6 +16,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from cogs import e2b_keepalive as ka
@@ -207,67 +208,17 @@ class LoopTests(unittest.TestCase):
         self.assertGreater(cog.window_start, 0.0)
 
 
-class SelfDiscoveryTests(unittest.TestCase):
-    """A reincarnated sandbox has no launcher to write its id, and its start
-    command env has no E2B_SANDBOX_ID — so it has to find itself."""
-
-    ROWS = [
-        {"sandboxID": "parent00000000000aa", "startedAt": "2026-11-19T01:00:00Z", "metadata": {}},
-        {"sandboxID": "successor00000000b", "startedAt": "2026-11-19T23:00:00Z",
-         "metadata": {"role": "successor", "parent": "parent00000000000aa"}},
-        {"sandboxID": "old-successor0000c", "startedAt": "2026-11-18T23:00:00Z",
-         "metadata": {"role": "successor", "parent": "someone"}},
-    ]
-
-    def _cog_with(self, payload, status=200):
-        cog = ka.KeepAliveCog(bot=mock.Mock())
-        outcome = mock.Mock(status_code=status)
-        outcome.json = lambda: payload
-        return cog, mock.patch.object(ka.KeepAliveCog, "_api",
-                                      mock.AsyncMock(return_value=outcome)).start()
-
-    def test_picks_the_newest_successor(self):
-        cog, _ = self._cog_with(self.ROWS)
-        try:
-            self.assertEqual(asyncio.run(cog.id_from_api("k")), "successor00000000b")
-        finally:
-            mock.patch.stopall()
-
-    def test_never_returns_the_parent(self):
-        cog, _ = self._cog_with([self.ROWS[0]])
-        try:
-            self.assertIsNone(asyncio.run(cog.id_from_api("k")))
-        finally:
-            mock.patch.stopall()
-
-    def test_handles_wrapped_payload(self):
-        cog, _ = self._cog_with({"sandboxes": self.ROWS})
-        try:
-            self.assertEqual(asyncio.run(cog.id_from_api("k")), "successor00000000b")
-        finally:
-            mock.patch.stopall()
-
-    def test_bad_status_is_none(self):
-        cog, _ = self._cog_with({}, status=500)
-        try:
-            self.assertIsNone(asyncio.run(cog.id_from_api("k")))
-        finally:
-            mock.patch.stopall()
-
-
 class WallTests(unittest.TestCase):
     class _Bot:
         async def wait_until_ready(self):
             return None
 
-    def test_the_wall_reincarnates_instead_of_just_pausing(self):
-        """Pausing means the bot is offline until the VPS wakes — most of the
-        night. The successor boots in ~90s on its own."""
+    def test_the_wall_backs_up_and_lets_itself_pause(self):
+        """Self-reincarnation does not work in this E2B version (creation envs
+        never reach the start command, and there is no file API from inside),
+        so the wall must back up and pause — a paused sandbox keeps everything
+        and the keeper outside gives it a fresh window."""
         cog = ka.KeepAliveCog(bot=self._Bot())
-        called = []
-
-        async def fake_reincarnate(self, sid, key):
-            called.append(sid)
 
         async def fake_ping(self, sid, key):
             return True
@@ -275,10 +226,18 @@ class WallTests(unittest.TestCase):
         with mock.patch.object(ka, "LIFETIME_H", 0.0), \
              mock.patch.object(ka, "resolve_sandbox_id", lambda: "ibsandbox1234567"), \
              mock.patch.object(ka, "resolve_api_key", lambda: "k"), \
-             mock.patch.object(ka.KeepAliveCog, "_reincarnate", fake_reincarnate), \
-             mock.patch.object(ka.KeepAliveCog, "ping", fake_ping):
+             mock.patch.object(ka.KeepAliveCog, "ping", fake_ping), \
+             mock.patch("cogs.backup.run_backup", lambda: "ok"), \
+             mock.patch.object(ka.asyncio, "get_event_loop", lambda: SimpleNamespace(
+                 run_in_executor=mock.AsyncMock(return_value="ok"))), \
+             self.assertLogs("cogs.e2b_keepalive", level="INFO") as logs:
             asyncio.run(cog._loop())
-        self.assertEqual(called, ["ibsandbox1234567"])
+        self.assertIn("letting the sandbox pause", "\n".join(logs.output))
+
+    def test_no_reincarnation_code_path_remains(self):
+        """It could never have worked — keep it out rather than let it look live."""
+        self.assertFalse(hasattr(ka.KeepAliveCog, "_reincarnate"))
+        self.assertFalse(hasattr(ka.KeepAliveCog, "id_from_api"))
 
 
 class StartScriptTests(unittest.TestCase):

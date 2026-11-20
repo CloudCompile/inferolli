@@ -29,8 +29,18 @@ rebuild_env_from_environment() {
 
 # --- if we booted with credentials but no file, use them NOW. Waiting ten
 #     minutes for a launcher that does not exist was a real outage: the
-#     reincarnated sandbox never started at all. ---
-if [ ! -f /bot/.env ] && printenv DISCORD_BOT_TOKEN >/dev/null 2>&1; then
+#     reincarnated sandbox never started at all.
+#
+#     The test is "are there credentials in the environment at ALL", not "is
+#     there a Discord token": a drill passed only the S3 keys, the stricter
+#     gate said no, and the sandbox waited out the full loop and idled. ---
+have_any_creds() {
+  for k in DISCORD_BOT_TOKEN E2B_API_KEY S3_ACCESS_KEY_ID S3_BUCKET; do
+    printenv "$k" >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+if [ ! -f /bot/.env ] && have_any_creds; then
   rebuild_env_from_environment
 fi
 slog "after bootstrap: .env=$(wc -c < /bot/.env 2>/dev/null || echo 0) bytes"

@@ -17,7 +17,7 @@ default), the bot could not boot and ping in 5 minutes, and it paused again.
 From the outside: "inferolli keeps stopping."
 
 Now it decides for itself, from sources that cannot silently be empty:
-    id  → E2B_SANDBOX_ID → /bot/.e2b-sandbox-id → E2B API (metadata mark)
+    id  → E2B_SANDBOX_ID → /bot/.e2b-sandbox-id (written by start.sh/launcher)
     key → E2B_API_KEY env → parsed out of /bot/.env
 and if it still can't, it says exactly what is missing instead of skipping.
 
@@ -144,37 +144,6 @@ class KeepAliveCog(commands.Cog):
             return await c.request(method, f"{API}{path}", headers=self._headers(key),
                                    json=json_body, params=params)
 
-    async def id_from_api(self, key: str) -> str | None:
-        """Self-discovery for a sandbox that was created by a predecessor.
-
-        A reincarnated sandbox has no launcher to write its id file, and the
-        start command's env does not carry E2B_SANDBOX_ID — so it asks the API
-        for the newest sandbox marked as a successor. The parent has no such
-        mark, so this cannot resolve to the parent.
-        """
-        try:
-            r = await self._api("GET", "/sandboxes", key=key, timeout=20.0)
-        except Exception as e:
-            log.warning("sandbox self-discovery failed: %s", e)
-            return None
-        if r.status_code != 200:
-            log.warning("sandbox self-discovery failed: HTTP %s", r.status_code)
-            return None
-        try:
-            data = r.json()
-        except Exception:
-            return None
-        rows = data if isinstance(data, list) else (data.get("sandboxes") or [])
-        best = None
-        for row in rows:
-            meta = row.get("metadata") or {}
-            if meta.get("role") != "successor":
-                continue
-            started = row.get("startedAt") or ""
-            if best is None or started > best[0]:
-                best = (started, row.get("sandboxID") or row.get("id"))
-        return best[1] if best else None
-
     async def ping(self, sandbox_id: str, key: str) -> bool:
         """Extend the running timeout. Returns True on success."""
         try:
@@ -194,47 +163,6 @@ class KeepAliveCog(commands.Cog):
             log.warning("keepalive ping failed: HTTP %s %s", r.status_code, r.text[:120])
         return False
 
-    # ---------- reincarnation ----------
-
-    async def _reincarnate(self, sandbox_id: str, key: str):
-        log.info("⏳ 23h reached — reincarnating (backup → successor → handover)")
-        try:
-            from cogs.backup import run_backup
-            summary = await asyncio.get_event_loop().run_in_executor(None, run_backup)
-            log.info("pre-migration backup: %s", summary)
-        except Exception:
-            log.exception("pre-migration backup failed — migrating anyway")
-
-        bootstrap = {k: os.environ[k] for k in
-                     ("S3_ENDPOINT", "S3_BUCKET", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY") if os.environ.get(k)}
-        bootstrap["E2B_API_KEY"] = key
-        bootstrap["E2B_KEEPALIVE"] = "1"
-        r = await self._api("POST", "/sandboxes", {
-            # the template ID, not the name: the start command env has an EMPTY
-            # E2B_TEMPLATE_ID in this version, and a name may not resolve.
-            "templateID": (os.environ.get("E2B_TEMPLATE_ID")
-                           or os.environ.get("E2B_TEMPLATE")
-                           or "4no9nprthep01xg42hgy"),
-            "timeout": TIMEOUT_S,
-            "autoPause": True,
-            "envVars": bootstrap,
-            # the successor finds itself by this mark (see id_from_api)
-            "metadata": {"role": "successor", "parent": sandbox_id},
-        }, timeout=60.0, key=key)
-        if r.status_code not in (200, 201):
-            log.error("successor creation FAILED: %s %s — staying alive as long as possible",
-                      r.status_code, r.text[:120])
-            return
-        new_id = r.json().get("sandboxID") or r.json().get("sandboxId") or r.json().get("id")
-        log.info("successor created: %s — pausing immediately so the two of us never "
-                 "hold the same Discord session", new_id)
-
-        log.info("handover complete — pausing myself")
-        try:
-            await self._api("POST", f"/sandboxes/{sandbox_id}/pause", timeout=15.0, key=key)
-        except Exception:
-            log.exception("self-pause failed (harmless — the wall will pause us)")
-
     # ---------- loop ----------
 
     async def _loop(self):
@@ -242,16 +170,6 @@ class KeepAliveCog(commands.Cog):
 
         sandbox_id = resolve_sandbox_id()
         key = resolve_api_key()
-        if key and not sandbox_id:
-            sandbox_id = await self.id_from_api(key)
-            if sandbox_id:
-                # remember it: start.sh and the next boot look here first
-                try:
-                    with open(ID_FILE, "w") as f:
-                        f.write(sandbox_id)
-                except OSError:
-                    pass
-                log.info("discovered own sandbox id from the API: %s", sandbox_id)
         if not sandbox_id or not key:
             missing = []
             if not sandbox_id:
@@ -282,14 +200,27 @@ class KeepAliveCog(commands.Cog):
 
             age_h = (time.time() - self.window_start) / 3600
             if age_h >= LIFETIME_H:
-                # E2B caps lifetime at 24h. Migrate ourselves instead of waiting for
-                # the VPS: the successor boots in ~90s, versus being offline until
-                # the VPS wakes up (it sleeps most of the night).
-                await self._reincarnate(sandbox_id, key)
-                # If the successor could not be created, stop pinging and let the
-                # lifecycle pause us — the shepherd can still resume a paused box.
-                log.info("24h wall approaching — letting the sandbox pause; the "
-                         "shepherd resumes us with a fresh window if still needed")
+                # E2B caps sandbox lifetime at 24h and pause+resume resets the
+                # window. Back up, STOP pinging, and let the lifecycle freeze us
+                # (on_timeout: pause). A paused sandbox keeps everything,
+                # including /bot/.env, so resuming it is pure gain.
+                #
+                # Self-reincarnation (create a successor from inside) does NOT
+                # work in this E2B version: creation envs never reach the start
+                # command — only exec sessions see them — and there is no file
+                # API reachable from inside a sandbox. A successor therefore
+                # boots with no secrets and idles. The keeper outside resumes
+                # this sandbox instead (see .github/workflows/keeper.yml and
+                # scripts/shepherd.py), and the fresh window restarts this loop.
+                try:
+                    from cogs.backup import run_backup
+                    summary = await asyncio.get_event_loop().run_in_executor(
+                        None, run_backup)
+                    log.info("pre-pause backup: %s", summary)
+                except Exception:
+                    log.exception("pre-pause backup failed — pausing anyway")
+                log.info("24h wall approaching — backed up; letting the sandbox pause "
+                         "until the keeper resumes us with a fresh window")
                 return
 
             await _sleep(PING_EVERY)

@@ -37,6 +37,15 @@ class StartShTests(unittest.TestCase):
     def test_only_idles_without_any_credentials(self):
         self.assertIn('if [ ! -s /bot/.env ]', self.text)
 
+    def test_rebuilds_when_any_credential_is_present(self):
+        """A drill passed only the S3 keys. The gate demanded a Discord token,
+        so nothing was rebuilt and the sandbox waited out the whole loop."""
+        self.assertIn("have_any_creds", self.text)
+        gate = self.text[self.text.index("have_any_creds() {"):]
+        gate = gate[:gate.index("}")]
+        for key in ("E2B_API_KEY", "S3_BUCKET", "S3_ACCESS_KEY_ID"):
+            self.assertIn(key, gate)
+
     def test_bootstrap_is_not_behind_a_long_wait(self):
         """The first attempt must happen BEFORE the wait loop.
 
