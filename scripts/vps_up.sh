@@ -76,15 +76,22 @@ else
 fi
 
 # --- 4. exactly one bot -------------------------------------------------------
-# pgrep patterns are bracket-escaped so this script's own command line can never
-# match itself (matching it kills the shell mid-run — learned the hard way).
-pids=$(pgrep -f '[-]u bot\.py' || true)
+# The pattern must match EVERY way bot.py gets started. An earlier version
+# required "-u bot.py" and so could not see the systemd unit's plain
+# "python /path/bot.py" — it happily started a second bot next to it, and two
+# sessions on one token steal each other's interactions (Discord answers
+# 10062 Unknown interaction and the command dies before it runs).
+if systemctl is-active --quiet discord-bot.service 2>/dev/null; then
+  slog "discord-bot.service is running the bot — systemd owns it, not starting one here"
+  exit 0
+fi
+pids=$(pgrep -f 'bot\.py' | grep -v "^$$\$" || true)
 if [ -n "$pids" ]; then
   if [ "${1:-}" = "--restart" ]; then
     slog "stopping bot: $(echo $pids | tr '\n' ' ')"
     kill $pids 2>/dev/null
     sleep 3
-    kill -9 $(pgrep -f '[-]u bot\.py' || true) 2>/dev/null
+    kill -9 $(pgrep -f 'bot\.py' | grep -v "^$$\$" || true) 2>/dev/null
   else
     slog "bot already running ($(echo $pids | tr '\n' ' ')) — not starting a second"
     exit 0
@@ -95,8 +102,8 @@ fi
 slog "starting the bot"
 cd "$ROOT" && setsid nohup .venv/bin/python -u bot.py >>"$ROOT/bot.log" 2>&1 &
 sleep 8
-if pgrep -f '[-]u bot\.py' >/dev/null; then
-  slog "bot running (pid $(pgrep -f '[-]u bot\.py' | tr '\n' ' '))"
+if pgrep -f 'bot\.py' | grep -qv "^$$\$"; then
+  slog "bot running (pid $(pgrep -f 'bot\.py' | tr '\n' ' '))"
 else
   slog "FATAL: the bot exited — see $ROOT/bot.log"
   tail -5 "$ROOT/bot.log"

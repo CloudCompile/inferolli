@@ -1,0 +1,22 @@
+[Unit]
+Description=Inferolli studio (tonearm + Apple Music) on the VPS
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=inferenceport
+WorkingDirectory=/home/inferenceport/tonearm
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=TONEARM_AUDIO=1
+Environment=TONEARM_AUDIO_SINK=inferolli_studio
+Environment=TONEARM_CHROME_BIN=google-chrome
+Environment=TONEARM_PORT=8188
+Environment=TONEARM_PROFILE=/home/inferenceport/.config/tonearm/inferolli-profile
+Environment=TONEARM_ENABLE_WRITES=1
+ExecStart=/home/inferenceport/discord-bot/scripts/studio_up.sh
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
