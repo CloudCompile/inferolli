@@ -19,6 +19,7 @@ a stalled Chromium whose sink has gone idle — that is exactly what happened.
 """
 
 import asyncio
+import os
 import unittest
 from unittest import mock
 
@@ -152,7 +153,7 @@ class StudioAudioTests(unittest.TestCase):
 
 
 class SinkNameTests(unittest.TestCase):
-    def test_reads_the_first_sink(self):
+    def test_reads_the_studio_sink(self):
         done = mock.Mock(stdout="1\ttonearm_audio\tmodule-null-sink.c\ts16le\n")
         with mock.patch.object(music.subprocess, "run", mock.Mock(return_value=done)):
             self.assertEqual(music._sink_name(), "tonearm_audio")
@@ -160,6 +161,53 @@ class SinkNameTests(unittest.TestCase):
     def test_no_pulse_returns_none(self):
         with mock.patch.object(music.subprocess, "run", mock.Mock(side_effect=FileNotFoundError)):
             self.assertIsNone(music._sink_name())
+
+    def test_a_desktop_sink_is_not_mistaken_for_the_studio(self):
+        """First-sink-wins captured the machine's own output on a real desktop."""
+        listed = ("1\talsa_output.pci-0000_00_1f.3.analog-stereo\tmodule-alsa-card.c\ts16le\n"
+                  "2\tremote_out\tmodule-null-sink.c\ts16le\n"
+                  "3\ttonearm_audio\tmodule-null-sink.c\ts16le\n")
+        with mock.patch.object(music.subprocess, "run",
+                               mock.Mock(return_value=mock.Mock(stdout=listed))):
+            self.assertEqual(music._sink_name(), "tonearm_audio")
+
+    def test_the_configured_sink_wins(self):
+        listed = "1\ttonearm_audio\tx\ty\n2\tinferolli_studio\tx\ty\n"
+        with mock.patch.dict(music.os.environ, {"TONEARM_AUDIO_SINK": "inferolli_studio"}), \
+             mock.patch.object(music.subprocess, "run",
+                               mock.Mock(return_value=mock.Mock(stdout=listed))):
+            self.assertEqual(music._sink_name(), "inferolli_studio")
+
+    def test_no_studio_sink_is_reported_rather_than_guessed(self):
+        listed = "1\talsa_output.usb\tx\ty\n2\tremote_out\tx\ty\n"
+        with mock.patch.dict(music.os.environ, {}, clear=False), \
+             mock.patch.object(music.subprocess, "run",
+                               mock.Mock(return_value=mock.Mock(stdout=listed))):
+            self.assertIsNone(music._pick_sink(["alsa_output.usb", "remote_out"], "tonearm_audio"))
+
+    def test_a_single_sink_is_still_used(self):
+        self.assertEqual(music._pick_sink(["whatever_studio"], "tonearm_audio"), "whatever_studio")
+
+
+class PulseRuntimeTests(unittest.TestCase):
+    """The bot must find the daemon it can actually talk to."""
+
+    def test_prefers_a_runtime_dir_with_a_live_socket(self):
+        def exists(path):
+            return path == "/run/user/1000/pulse/native"
+
+        with mock.patch.dict(music.os.environ, {"XDG_RUNTIME_DIR": "/tmp/pulse-runtime"}), \
+             mock.patch.object(music.os.path, "exists", mock.Mock(side_effect=exists)):
+            self.assertEqual(music._pulse_runtime(), f"/run/user/{music.os.getuid()}")
+
+    def test_env_runtime_dir_is_used_when_it_is_live(self):
+        with mock.patch.dict(music.os.environ, {"XDG_RUNTIME_DIR": "/custom"}), \
+             mock.patch.object(music.os.path, "exists", mock.Mock(return_value=True)):
+            self.assertEqual(music._pulse_runtime(), "/custom")
+
+    def test_no_daemon_anywhere_is_none(self):
+        with mock.patch.object(music.os.path, "exists", mock.Mock(return_value=False)):
+            self.assertIsNone(music._pulse_env().get("XDG_RUNTIME_DIR") and music._pulse_runtime())
 
 
 class AttachTests(unittest.TestCase):
@@ -464,25 +512,38 @@ if __name__ == "__main__":
 
 class PulseEnvTests(unittest.TestCase):
     """A bot that cannot reach the studio's pulse daemon captures silence from
-    a *different* server — the sink looks fine and the audio is dead air."""
+    a *different* server — the sink looks fine and the audio is dead air.
 
-    def test_runtime_dir_defaults_to_the_studios(self):
-        import os
-        env = {"PATH": "/usr/bin"}
-        with mock.patch.dict(os.environ, env, clear=True), \
-             mock.patch.object(music.os.path, "isdir", return_value=True):
+    The dir itself differs per host (sandbox: /tmp/pulse-runtime, desktop:
+    /run/user/1000), so the rule is "the first one with a live socket", not a
+    hard-coded path. These tests fake the filesystem so they hold anywhere.
+    """
+
+    def _live(self, *dirs):
+        def exists(path):
+            return any(path == os.path.join(d, "pulse", "native") for d in dirs)
+        return mock.Mock(side_effect=exists)
+
+    def test_a_socketless_env_dir_falls_through_to_the_studio_dir(self):
+        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/stale"}, clear=True), \
+             mock.patch.object(music.os.path, "exists", self._live("/tmp/pulse-runtime")):
             self.assertEqual(music._pulse_env()["XDG_RUNTIME_DIR"], "/tmp/pulse-runtime")
 
-    def test_an_existing_runtime_dir_is_respected(self):
-        import os
+    def test_the_desktop_daemon_is_found_when_the_env_has_nothing(self):
+        user_dir = f"/run/user/{os.getuid()}"
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(music.os.path, "exists", self._live(user_dir)):
+            self.assertEqual(music._pulse_env()["XDG_RUNTIME_DIR"], user_dir)
+
+    def test_a_live_env_dir_is_respected(self):
         with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/tmp/mine"}, clear=True), \
-             mock.patch.object(music.os.path, "isdir", return_value=True):
+             mock.patch.object(music.os.path, "exists", self._live("/tmp/mine")):
             self.assertEqual(music._pulse_env()["XDG_RUNTIME_DIR"], "/tmp/mine")
 
-    def test_missing_runtime_dir_is_not_invented(self):
-        import os
+    def test_missing_daemon_is_not_invented(self):
         with mock.patch.dict(os.environ, {}, clear=True), \
-             mock.patch.object(music.os.path, "isdir", return_value=False):
+             mock.patch.object(music.os.path, "exists", self._live()):
+            self.assertIsNone(music._pulse_runtime())
             self.assertNotIn("XDG_RUNTIME_DIR", music._pulse_env())
 
 
@@ -569,3 +630,76 @@ class VoiceEncryptionTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"TONEARM_VOICE_E2EE": "1"}):
             music._prefer_plain_voice()
         self.assertIs(voice_state.VoiceConnectionState.max_dave_protocol_version, before)
+
+
+class VoiceReadinessTests(unittest.TestCase):
+    """/voicecheck joined, left, and errored in the same second.
+
+    The traceback was `vc.play()` raising ClientException('Not connected to
+    voice') at the exact instant the log said "Voice connection complete":
+    connect() can return a client that cannot accept a source yet. Two copies
+    of the bot logged into the same session produce the same symptom, so the
+    user hit both at once — hence a real wait, and a message that names the
+    duplicate-session possibility instead of a stack trace.
+    """
+
+    def run_async(self, coro):
+        return asyncio.run(coro)
+
+    def _cog(self):
+        return music.MusicCog(bot=mock.Mock())
+
+    def test_waits_for_a_client_that_is_not_ready_yet(self):
+        vc = mock.Mock()
+        vc.is_connected.side_effect = [False, False, True]
+        with mock.patch("asyncio.sleep", mock.AsyncMock()):
+            self.assertTrue(self.run_async(self._cog()._wait_voice_ready(vc, timeout=5)))
+
+    def test_gives_up_when_it_never_becomes_ready(self):
+        vc = mock.Mock()
+        vc.is_connected.return_value = False
+        with mock.patch("asyncio.sleep", mock.AsyncMock()):
+            self.assertFalse(self.run_async(self._cog()._wait_voice_ready(vc, timeout=0.1)))
+
+    def test_a_link_that_never_settles_is_explained_not_raised(self):
+        ch = mock.Mock(mention="#voice")
+        ch.guild = mock.Mock()
+        ch.permissions_for.return_value = mock.Mock(connect=True, speak=True)
+        vc = mock.Mock()
+        vc.is_connected.return_value = False
+        ch.connect = mock.AsyncMock(return_value=vc)
+        guild = mock.Mock(voice_client=None)
+        inter = mock.Mock(guild=guild, user=mock.Mock())
+        inter.user.voice = mock.Mock(channel=ch)
+        ticks = [0.0]
+
+        def ticking():
+            ticks[0] += 1.0
+            return ticks[0]
+
+        with mock.patch("asyncio.sleep", mock.AsyncMock()), \
+             mock.patch.object(music.time, "monotonic", ticking):
+            got, why = self.run_async(self._cog()._join(inter))
+        self.assertIsNone(got)
+        self.assertIn("another copy", why)
+
+    def test_the_tone_survives_a_client_that_was_not_ready(self):
+        """vc.play() is retried, so a slow handshake is not a failed command."""
+        vc = mock.Mock()
+        vc.is_connected.return_value = True
+        vc.play.side_effect = [__import__("discord").ClientException("Not connected to voice"), None]
+        inter = mock.Mock()
+        inter.response.defer = mock.AsyncMock()
+        inter.followup.send = mock.AsyncMock()
+        cog = self._cog()
+        cog._join = mock.AsyncMock(return_value=(vc, None))
+        cog._stop_voice = mock.Mock()
+        cog._audio_report = mock.AsyncMock(return_value="report")
+        cog._start_stream = mock.AsyncMock(return_value=None)
+        with mock.patch.object(music, "ToneSource", mock.Mock()), \
+             mock.patch("asyncio.sleep", mock.AsyncMock()), \
+             mock.patch("asyncio.run_coroutine_threadsafe", mock.Mock()), \
+             mock.patch("asyncio.get_running_loop", mock.Mock(return_value=mock.Mock())):
+            self.run_async(cog.voicecheck.callback(cog, inter))
+        self.assertEqual(vc.play.call_count, 2, "the second attempt must happen")
+        self.assertTrue(inter.followup.send.called)

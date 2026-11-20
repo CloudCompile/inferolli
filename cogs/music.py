@@ -346,16 +346,30 @@ FRAME = 3840
 READ_TIMEOUT = 0.06
 
 
-def _pulse_env() -> dict:
-    """Environment that can reach the studio's PulseAudio daemon.
+def _pulse_runtime() -> str | None:
+    """The PulseAudio runtime dir that actually has a live socket.
 
-    start.sh gives tonearm an XDG_RUNTIME_DIR it can own (/tmp/pulse-runtime),
-    because /run/user/1000 does not exist in the sandbox — and a bot launched
-    without it reads a *different* (or no) daemon and captures silence.
+    This used to assume the sandbox's /tmp/pulse-runtime. On the VPS the
+    daemon lives in /run/user/1000, so the assumption meant the bot talked to
+    a daemon that was not there and captured nothing. Ask the filesystem.
     """
+    seen = []
+    for candidate in (os.environ.get("XDG_RUNTIME_DIR"),
+                      f"/run/user/{os.getuid()}",
+                      "/tmp/pulse-runtime"):
+        if not candidate or candidate in seen:
+            continue
+        seen.append(candidate)
+        if os.path.exists(os.path.join(candidate, "pulse", "native")):
+            return candidate
+    return None
+
+
+def _pulse_env() -> dict:
+    """Environment that can reach the studio's PulseAudio daemon."""
     env = dict(os.environ)
-    runtime = env.get("XDG_RUNTIME_DIR") or "/tmp/pulse-runtime"
-    if os.path.isdir(runtime):
+    runtime = _pulse_runtime()
+    if runtime:
         env["XDG_RUNTIME_DIR"] = runtime
     return env
 
@@ -378,16 +392,38 @@ def _wake_sink(sink: str | None) -> None:
         log.debug("could not wake the studio sink", exc_info=True)
 
 
+def _pick_sink(sinks: list[str], want: str) -> str | None:
+    """Choose the studio's sink out of whatever the daemon lists.
+
+    Taking the first sink was fine in the sandbox, where the studio's was the
+    only one. On a desktop it is not: picking the first sink there captures the
+    machine's own output (or a remote-desktop sink) instead of the music.
+    """
+    if want in sinks:
+        return want
+    studio = [s for s in sinks if "tonearm" in s.lower()]
+    if len(studio) == 1:
+        return studio[0]
+    if studio:
+        return studio[0]
+    if len(sinks) == 1:
+        return sinks[0]
+    return None
+
+
 def _sink_name() -> str | None:
-    """The PulseAudio sink the studio plays into (tonearm_audio by default)."""
+    """The PulseAudio sink the studio plays into."""
+    want = os.environ.get("TONEARM_AUDIO_SINK") or "tonearm_audio"
     try:
         out = subprocess.run(["pactl", "list", "short", "sinks"],
                              capture_output=True, text=True, timeout=5,
                              env=_pulse_env())
+        sinks = []
         for line in (out.stdout or "").splitlines():
             parts = line.split()
             if len(parts) >= 2:
-                return parts[1]
+                sinks.append(parts[1])
+        return _pick_sink(sinks, want)
     except Exception:
         log.debug("no pactl — falling back to the HTTP stream", exc_info=True)
     return None
@@ -981,6 +1017,25 @@ class MusicCog(commands.Cog):
 
     # ---------- voice ----------
 
+    async def _wait_voice_ready(self, vc, timeout: float = 20.0) -> bool:
+        """Wait until the voice client will actually accept a source.
+
+        `channel.connect()` can return a client that reports "not connected"
+        for a moment after the handshake completes. Calling play() in that gap
+        raises ClientException('Not connected to voice') — which is what made
+        /voicecheck join, leave and error out in the same second.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                if vc is not None and vc.is_connected():
+                    return True
+            except Exception:
+                log.debug("voice client unusable while waiting", exc_info=True)
+                return False
+            await asyncio.sleep(0.25)
+        return False
+
     async def _join(self, interaction: discord.Interaction):
         """Join (or move to) the asker's voice channel. Returns (vc, why_not)."""
         user = getattr(interaction, "user", None)
@@ -992,7 +1047,15 @@ class MusicCog(commands.Cog):
         if vc is None or not vc.is_connected():
             if not (perms.connect and perms.speak):
                 return None, f"i can't join {ch.mention} — check my Connect/Speak permissions"
-            vc = await ch.connect(self_deaf=True)
+            try:
+                vc = await ch.connect(self_deaf=True, timeout=30)
+            except Exception as exc:
+                log.warning("voice connect failed: %s", exc)
+                return None, "voice wouldn't connect just now — give it a few seconds and try again"
+            if not await self._wait_voice_ready(vc):
+                return None, ("i joined but the voice link never became usable — "
+                              "if this keeps happening, another copy of me may be "
+                              "logged in somewhere")
         elif vc.channel != ch:
             await vc.move_to(ch)
         return vc, None
@@ -1415,7 +1478,21 @@ class MusicCog(commands.Cog):
                 log.info("test tone finished: %d frames sent", tone.frames)
             asyncio.run_coroutine_threadsafe(self._start_stream(vc), loop)
 
-        vc.play(tone, after=after)
+        started = False
+        for attempt in range(3):
+            try:
+                vc.play(tone, after=after)
+                started = True
+                break
+            except discord.ClientException as exc:
+                log.warning("tone did not start (attempt %d): %s", attempt + 1, exc)
+                await self._wait_voice_ready(vc, timeout=5.0)
+                await asyncio.sleep(0.5)
+        if not started:
+            return await interaction.followup.send(
+                "🎧 i couldn't start the tone — my voice connection isn't usable. "
+                "run /voicecheck again in a few seconds; if it keeps failing, a "
+                "second copy of me is probably logged in.", ephemeral=True)
         await asyncio.sleep(1.0)
         report = await self._audio_report(vc)
         embed = discord.Embed(
