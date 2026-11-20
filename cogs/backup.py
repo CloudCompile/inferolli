@@ -23,6 +23,22 @@ log = logging.getLogger("cogs.backup")
 DATA_DIR = Path(__file__).parent.parent / "data"
 RETENTION_DAYS = 30
 
+# The tonearm music studio's Apple Music session. The whole chrome profile is
+# ~460MB of cache; only these files hold the login. They ride the nightly
+# backup because cookies refresh constantly — a stale copy eventually logs
+# the studio out, and re-login needs a 2FA human.
+TONEARM_CFG = Path(os.environ.get("TONEARM_CONFIG_DIR")
+                   or (Path.home() / ".config" / "tonearm"))
+TONEARM_KEEP = (
+    "master-key.txt",
+    "chrome-profile/Local State",
+    "chrome-profile/Default/Cookies",
+    "chrome-profile/Default/Cookies-journal",
+    "chrome-profile/Default/Local Storage",
+    "chrome-profile/Default/Preferences",
+    "chrome-profile/Default/Secure Preferences",
+)
+
 
 def _s3():
     import boto3
@@ -51,6 +67,10 @@ def _make_tarball() -> bytes:
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         tar.add(DATA_DIR, arcname="data",
                 filter=lambda ti: None if "/xdg/" in ti.name else ti)  # opencode's sqlite: server-managed
+        for rel in TONEARM_KEEP:
+            p = TONEARM_CFG / rel
+            if p.exists():
+                tar.add(p, arcname=f"tonearm/{rel}")
     return buf.getvalue()
 
 
@@ -96,8 +116,21 @@ def restore_latest() -> str:
 
     buf = io.BytesIO(blob)
     with tarfile.open(fileobj=buf, mode="r:gz") as tar:
-        tar.extractall(DATA_DIR.parent)
+        tar.extractall(DATA_DIR.parent,
+                       members=[m for m in tar.getmembers()
+                                if not m.name.startswith("tonearm/")])
+        studio = [m for m in tar.getmembers() if m.name.startswith("tonearm/")]
     n = sum(1 for _ in DATA_DIR.rglob("*.json"))
+
+    # the music studio's Apple Music session → ~/.config/tonearm
+    if studio:
+        with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
+            members = [m for m in tar.getmembers() if m.name.startswith("tonearm/")]
+            for m in members:
+                m.name = m.name[len("tonearm/"):]
+            TONEARM_CFG.mkdir(parents=True, exist_ok=True)
+            tar.extractall(TONEARM_CFG, members=members)
+        n += len(members)
 
     # secrets: restore .env if it's missing (reincarnation boot)
     env_file = Path(__file__).parent.parent / ".env"

@@ -92,11 +92,16 @@ class MusicCog(commands.Cog):
         elif vc.channel != ch:
             await vc.move_to(ch)
         if not vc.is_playing():
-            # preflight the stream — mock mode serves no audio by design
-            async with httpx.AsyncClient(timeout=10.0) as c:
-                r = await c.head(f"{URL}/api/audio/stream.mp3?api_key={KEY}")
-            if r.status_code != 200:
-                return None  # studio isn't streaming (no live session yet)
+            # preflight the studio's audio pump. NB: the stream endpoint has
+            # no HEAD support (405), so the old HEAD probe always failed and
+            # /play never joined a voice channel. /api/audio/status is the
+            # honest check — it reports whether the pump is running at all.
+            try:
+                st = await _get("/audio/status")
+            except Exception:
+                return None  # studio isn't reachable/streaming
+            if not st.get("running"):
+                return None  # no live session yet (browser not playing)
             src = discord.FFmpegPCMAudio(
                 f"{URL}/api/audio/stream.mp3?api_key={KEY}",
                 before_options=["-loglevel", "error"],

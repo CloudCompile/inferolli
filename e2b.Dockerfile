@@ -41,6 +41,13 @@ COPY . .
 # write bot.log and the memory cortex files
 RUN chown -R 1000:1000 /bot
 
+# tonearm — the music studio, IN this sandbox (drives Apple Music through CDP
+# on the bundled chromium). The Apple Music session profile is NOT baked in;
+# start.sh restores it from the nightly S3 backup (cookies are credentials).
+RUN git clone --depth 1 https://github.com/CloudCompile/tonearm.git /home/user/tonearm \
+    && pip install --no-cache-dir -r /home/user/tonearm/requirements.txt \
+    && chown -R 1000:1000 /home/user/tonearm
+
 # start.sh: restores latest brain backup, then runs the bot under a
 # crash-restarting supervisor loop (no systemd inside the microVM)
 COPY start.sh /start.sh

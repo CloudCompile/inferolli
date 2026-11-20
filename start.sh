@@ -120,6 +120,29 @@ for _ in $(seq 1 20); do
   sleep 0.5
 done
 
+# --- tonearm: the music studio lives IN this sandbox ---
+# It used to be a separate e2b sandbox whose URL went stale whenever that box
+# paused — /play dialed a dead host and voice parties stayed silent (the bot's
+# preflight needs a live pump). In-sandbox: one thing to keep alive, one URL.
+TONearm_DIR=/home/user/tonearm
+TONearm_CFG=/home/user/.config/tonearm
+start_tonearm() {
+  [ -d "$TONearm_DIR" ] || return 0
+  if [ ! -f "$TONearm_CFG/chrome-profile/Default/Cookies" ]; then
+    slog "tonearm: no Apple Music session profile — studio skipped"
+    return 0
+  fi
+  curl -s -m 2 http://127.0.0.1:8188/health >/dev/null 2>&1 && return 0
+  # pulse needs a runtime dir it can OWN — /run/user/1000 doesn't exist in the
+  # sandbox, and without it chrome plays to a dead daemon (digital silence)
+  mkdir -p /tmp/pulse-runtime && chmod 700 /tmp/pulse-runtime 2>/dev/null
+  ( cd "$TONearm_DIR" && XDG_RUNTIME_DIR=/tmp/pulse-runtime \
+      TONEARM_AUDIO=1 TONEARM_CHROME_BIN=chromium TONEARM_PORT=8188 \
+      setsid nohup python3 -m tonearm >> /tmp/tonearm.log 2>&1 & )
+  slog "tonearm: studio launched"
+}
+start_tonearm
+
 # --- our own runtime window: do not rely on the VPS being awake ---
 # `e2b sandbox resume` grants only 5 minutes by default, which is less than a
 # cold boot; without this the sandbox pauses again before the bot can ever
@@ -198,6 +221,7 @@ ensure_tunnel() {
   ensure_tunnel
   pgrep -f 'opencode serve' >/dev/null || \
     (nohup opencode serve --port 4096 > /tmp/opencode-serve.log 2>&1 &)
+  start_tonearm
 done > /dev/null 2>&1 &)
 
 # --- run the bot under a supervisor loop (logs to /bot/bot.log) ---
