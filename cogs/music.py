@@ -167,6 +167,22 @@ def not_owned_message(name: str) -> str:
             f"new one with `/playlist new`.")
 
 
+async def _refusal(pid: str, fallback: str) -> str:
+    """Say WHICH playlist was refused. The id in a slash command is friendly
+    to the bot and meaningless to a person, so look the name up when we can."""
+    name = owned().get(pid, {}).get("name")
+    if not name:
+        try:
+            name = next((r["name"] for r in await _library_playlists()
+                         if r["id"] == pid), None)
+        except Exception:
+            name = None
+    if not name:
+        cleaned = (fallback or "").split(":", 1)[-1]
+        name = cleaned if cleaned and not cleaned.startswith(("p.", "pl.")) else "that playlist"
+    return not_owned_message(name)
+
+
 # ---------------------------------------------------------------- rows
 
 def _row(kind: str, r: dict) -> dict:
@@ -589,26 +605,57 @@ def _filter(rows: list[dict], current: str) -> list[dict]:
             or term in (r.get("artist") or "").lower()]
 
 
+AC_TIMEOUT = 2.4  # Discord gives autocomplete 3s — leave headroom
+
+
+async def _quiet(coro):
+    try:
+        return await coro
+    except Exception:
+        return []
+
+
+async def _within(coros, timeout: float | None = None):
+    """Run lookups concurrently and keep whatever finished in time.
+
+    Autocomplete is killed at ~3s; a slow studio must degrade the menu, not
+    erase it — so a slow option never costs the fast ones their results.
+    """
+    tasks = [asyncio.ensure_future(c) for c in coros]
+    done, pending = await asyncio.wait(tasks, timeout=timeout or AC_TIMEOUT)
+    for task in pending:
+        task.cancel()
+    rows = []
+    for task in done:
+        if task.cancelled():
+            continue
+        try:
+            rows.extend(task.result() or [])
+        except Exception:
+            continue
+    return rows
+
+
 async def _ac_play(interaction: discord.Interaction, current: str):
     if not _configured():
         return []
     term = (current or "").strip()
-    rows: list[dict] = []
-    if term:
-        try:
-            rows += await _catalog_search(
-                term, "songs,albums,playlists,stations", limit=4)
-        except Exception:
-            log.debug("play autocomplete: catalog search failed", exc_info=True)
-        try:
-            # the account's own stations never appear in catalog search
-            rows += _soft_filter(await _station_list(), term)[:3]
-        except Exception:
-            log.debug("play autocomplete: stations failed", exc_info=True)
-    try:
-        rows += _filter(await _library_playlists(), term)[:4]
-    except Exception:
-        log.debug("play autocomplete: library playlists failed", exc_info=True)
+    if not term:
+        return []
+
+    async def catalog_rows():
+        return await _catalog_search(
+            term, "songs,albums,playlists,stations", limit=4)
+
+    async def station_rows():
+        # the account's own stations never appear in catalog search
+        return _soft_filter(await _station_list(), term)[:3]
+
+    async def library_rows():
+        return _filter(await _library_playlists(), term)[:4]
+
+    rows = await _within([_quiet(catalog_rows()), _quiet(station_rows()),
+                          _quiet(library_rows())])
     return _choices(rows)
 
 
@@ -622,22 +669,20 @@ async def _ac_library_playlist(interaction: discord.Interaction, current: str):
 
 
 async def _ac_owned_playlist(interaction: discord.Interaction, current: str):
-    """Only playlists the bot created can be edited, so only those autocomplete."""
+    """Only playlists the bot created can be edited, so only those autocomplete.
+
+    Read straight from the ownership ledger: no studio round-trip, so this
+    answers inside Discord's deadline even when Apple is slow.
+    """
     if not _configured():
         return []
-    rows = []
-    try:
-        library = {r["id"]: r for r in await _library_playlists()}
-    except Exception:
-        library = {}
     term = (current or "").strip().lower()
+    rows = []
     for pid, meta in owned().items():
-        row = library.get(pid) or {"kind": "playlists", "id": pid,
-                                   "name": meta.get("name") or pid,
-                                   "artist": "", "artwork": None}
-        if term and term not in (row.get("name") or "").lower():
+        name = meta.get("name") or pid
+        if term and term not in name.lower():
             continue
-        rows.append(row)
+        rows.append({"kind": "playlists", "id": pid, "name": name, "artist": ""})
     # newest first — the one you just made is the one you want
     rows.sort(key=lambda r: owned().get(r["id"], {}).get("at", 0), reverse=True)
     return _choices(rows)
@@ -648,16 +693,16 @@ async def _ac_add_source(interaction: discord.Interaction, current: str):
     if not _configured():
         return []
     term = (current or "").strip()
-    rows: list[dict] = []
-    if term:
-        try:
-            rows += await _catalog_search(term, "songs,albums,playlists", limit=4)
-        except Exception:
-            return []
-    try:
-        rows += _filter(await _library_playlists(), term)[:3]
-    except Exception:
-        pass
+    if not term:
+        return []
+
+    async def catalog_rows():
+        return await _catalog_search(term, "songs,albums,playlists", limit=4)
+
+    async def library_rows():
+        return _filter(await _library_playlists(), term)[:3]
+
+    rows = await _within([_quiet(catalog_rows()), _quiet(library_rows())])
     return _choices(rows)
 
 
@@ -1068,10 +1113,11 @@ class MusicCog(commands.Cog):
         if not _configured():
             return await interaction.response.send_message("the studio isn't wired up yet 🎧", ephemeral=True)
         await interaction.response.defer()
-        pid, pname = _decode(playlist)
+        kind, pid = _decode(playlist)
         if not pid or not is_owned(pid):
             return await interaction.followup.send(
-                not_owned_message(pname or playlist), ephemeral=True)
+                await _refusal(pid, playlist), ephemeral=True)
+        pname = owned().get(pid, {}).get("name") or pid
         kind, rid = _decode(query)
         if kind is None:
             try:
@@ -1108,10 +1154,11 @@ class MusicCog(commands.Cog):
         if not _configured():
             return await interaction.response.send_message("the studio isn't wired up yet 🎧", ephemeral=True)
         await interaction.response.defer()
-        pid, pname = _decode(playlist)
+        kind, pid = _decode(playlist)
         if not pid or not is_owned(pid):
             return await interaction.followup.send(
-                not_owned_message(pname or playlist), ephemeral=True)
+                await _refusal(pid, playlist), ephemeral=True)
+        pname = owned().get(pid, {}).get("name") or pid
         try:
             tracks = await _playlist_tracks(pid)
         except Exception as exc:
@@ -1138,10 +1185,11 @@ class MusicCog(commands.Cog):
         if not _configured():
             return await interaction.response.send_message("the studio isn't wired up yet 🎧", ephemeral=True)
         await interaction.response.defer()
-        pid, pname = _decode(playlist)
+        kind, pid = _decode(playlist)
         if not pid or not is_owned(pid):
             return await interaction.followup.send(
-                not_owned_message(pname or playlist), ephemeral=True)
+                await _refusal(pid, playlist), ephemeral=True)
+        pname = owned().get(pid, {}).get("name") or pid
         try:
             await _request("PATCH", f"/write/playlists/{pid}",
                            params={"name": name}, timeout=WRITE_TIMEOUT)
@@ -1157,10 +1205,11 @@ class MusicCog(commands.Cog):
     async def pl_delete(self, interaction: discord.Interaction, playlist: str):
         if not _configured():
             return await interaction.response.send_message("the studio isn't wired up yet 🎧", ephemeral=True)
-        pid, pname = _decode(playlist)
+        kind, pid = _decode(playlist)
         if not pid or not is_owned(pid):
             return await interaction.response.send_message(
-                not_owned_message(pname or playlist), ephemeral=True)
+                await _refusal(pid, playlist), ephemeral=True)
+        pname = owned().get(pid, {}).get("name") or pid
 
         async def answer(it: discord.Interaction, yes: bool):
             if not yes:

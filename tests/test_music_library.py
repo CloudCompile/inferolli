@@ -299,6 +299,27 @@ class SoftFilterTests(unittest.TestCase):
 
 
 class AutocompleteTests(unittest.TestCase):
+    def test_a_slow_lookup_does_not_blank_the_menu(self):
+        """Discord kills autocomplete at 3s. The fast catalog hit must survive
+        a lookup that hangs (Apple slow, library walk cold)."""
+        import time as _time
+
+        async def slow(*a, **kw):
+            await asyncio.sleep(0.4)
+            return []
+
+        async def fast(term, types, limit=5):
+            return [{"kind": "songs", "id": "1", "name": "Get Lucky", "artist": ""}]
+
+        with mock.patch.multiple(music, URL="http://x", KEY="k", AC_TIMEOUT=0.05), \
+             mock.patch.object(music, "_catalog_search", mock.Mock(side_effect=fast)), \
+             mock.patch.object(music, "_station_list", mock.Mock(side_effect=slow)), \
+             mock.patch.object(music, "_library_playlists", mock.Mock(side_effect=slow)):
+            started = _time.monotonic()
+            out = run(music._ac_play(mock.Mock(), "get lucky"))
+            elapsed = _time.monotonic() - started
+        self.assertIn("songs:1", [c.value for c in out])
+        self.assertLess(elapsed, 0.3)
     def test_nothing_when_studio_not_wired(self):
         with mock.patch.multiple(music, URL="", KEY=""):
             self.assertEqual(run(music._ac_play(mock.Mock(), "daft")), [])
@@ -397,6 +418,74 @@ class GuardTests(unittest.TestCase):
         self.assertIn("one of yours", text)
         self.assertIn("only edit playlists I created", text)
 
+    def _owned_state(self, tmp: str, pid: str = "p.mine", name: str = "Drill"):
+        old = music.STATE_FILE
+        music.STATE_FILE = Path(tmp) / "music.json"
+        music.mark_owned(pid, name, 7)
+        return old
+
+    def test_an_owned_playlist_gets_past_the_guard(self):
+        """Regression: _decode returns (kind, id) — unpacking it as (id, name)
+        made every edit command refuse the bot's OWN playlists."""
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self._owned_state(tmp)
+            try:
+                inter = self._interaction()
+                cog = music.MusicCog(bot=mock.Mock())
+                calls = []
+
+                async def fake_request(method, path, **kw):
+                    calls.append((method, path, kw.get("body")))
+                    return {"ok": True}
+
+                with mock.patch.multiple(music, URL="http://x", KEY="k"), \
+                     mock.patch.object(music, "_request",
+                                       mock.Mock(side_effect=fake_request)), \
+                     mock.patch.object(music, "_forget_library_cache", lambda: None), \
+                     mock.patch.object(music, "_song_ids",
+                                       mock.AsyncMock(return_value=["1", "2"])):
+                    run(music.MusicCog.pl_add.callback(
+                        cog, inter, "playlists:p.mine", "albums:617154241"))
+            finally:
+                music.STATE_FILE = old
+        said = inter.followup.send.call_args[0][0]
+        self.assertIn("added", said)
+        self.assertEqual(calls[0][0], "POST")
+        self.assertEqual(calls[0][1], "/write/playlists/p.mine/tracks")
+        self.assertEqual(calls[0][2], ["1", "2"])
+
+    def test_remove_and_rename_and_delete_work_on_owned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self._owned_state(tmp)
+            try:
+                cog = music.MusicCog(bot=mock.Mock())
+                calls = []
+
+                async def fake_request(method, path, **kw):
+                    calls.append((method, path))
+                    return {"ok": True}
+
+                tracks = [{"name": "a", "artist": "x", "library_id": "i.1"},
+                          {"name": "b", "artist": "y", "library_id": "i.2"}]
+                with mock.patch.multiple(music, URL="http://x", KEY="k"), \
+                     mock.patch.object(music, "_request",
+                                       mock.Mock(side_effect=fake_request)), \
+                     mock.patch.object(music, "_playlist_tracks",
+                                       mock.AsyncMock(return_value=tracks)), \
+                     mock.patch.object(music, "_forget_library_cache", lambda: None), \
+                     mock.patch.object(music, "_library_playlists",
+                                       mock.AsyncMock(return_value=[{"id": "p.mine"}])):
+                    run(music.MusicCog.pl_remove.callback(
+                        cog, self._interaction(), "playlists:p.mine", 1))
+                    run(music.MusicCog.pl_rename.callback(
+                        cog, self._interaction(), "playlists:p.mine", "New"))
+                    renamed = music.owned()["p.mine"]["name"]
+            finally:
+                music.STATE_FILE = old
+        self.assertIn(("PUT", "/write/playlists/p.mine/tracks"), calls)
+        self.assertIn(("PATCH", "/write/playlists/p.mine"), calls)
+        self.assertEqual(renamed, "New")
+
     def test_remove_requires_owned_playlist(self):
         inter = self._interaction()
         cog = music.MusicCog(bot=mock.Mock())
@@ -404,6 +493,20 @@ class GuardTests(unittest.TestCase):
             run(music.MusicCog.pl_remove.callback(cog, inter, "p.YJXV3lJuekYea8V", 1))
         text = inter.followup.send.call_args[0][0]
         self.assertIn("one of yours", text)
+
+    def test_refusal_names_the_playlist_not_the_id(self):
+        """A person never typed p.YJXV3… — don't hand the id back to them."""
+        async def library(force=False):
+            return [{"kind": "playlists", "id": "p.YJXV3lJuekYea8V",
+                     "name": "ACTUALLY GOOD PHONK", "artist": ""}]
+
+        with mock.patch.multiple(music, URL="http://x", KEY="k"), \
+             mock.patch.object(music, "_library_playlists", mock.Mock(side_effect=library)):
+            text = run(music._refusal("p.YJXV3lJuekYea8V", "playlists:p.YJXV3lJuekYea8V"))
+            unknown = run(music._refusal("p.gone", "playlists:p.gone"))
+        self.assertIn("ACTUALLY GOOD PHONK", text)
+        self.assertNotIn("p.YJXV3", text)
+        self.assertIn("that playlist", unknown)
 
     def test_delete_requires_owned_playlist(self):
         inter = self._interaction()
