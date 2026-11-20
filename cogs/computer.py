@@ -153,14 +153,26 @@ async def oc_session(channel_id: int, title: str) -> str | None:
     return None
 
 
+# How much of a reply prompt reaches the agent. This used to be 6000, and the
+# caller appends the persona + memory + server pulse + "you have a real desktop"
+# + the actions menu AFTER the conversation, so on a busy server the instructions
+# were silently cut off — the bot had bash and chromium and had never been told.
+# That is why it answered "i can't clone stuff or read my own source, no chrome,
+# no screenshots" while sitting inside a sandbox with all three.
+OC_PROMPT_MAX = 60000
+
+
 async def oc_ask(session_id: str, prompt: str, system: str | None = None,
                  timeout: float = 150.0) -> str | None:
     """Send a prompt into a persistent opencode session, then poll for the
     assistant's reply. v2's prompt endpoint is async — the agent works in the
     background and the reply lands in the session's message list."""
+    if len(prompt) > OC_PROMPT_MAX:
+        log.warning("reply prompt is %d chars — truncating to %d; the tail carries the "
+                    "tool/desktop instructions", len(prompt), OC_PROMPT_MAX)
     async with _httpx.AsyncClient(timeout=30.0, auth=_auth()) as c:
         r = await c.post(f"http://localhost:{OC_PORT}/api/session/{session_id}/prompt",
-                         json={"text": prompt[:6000]})
+                         json={"text": prompt[:OC_PROMPT_MAX]})
         if r.status_code != 200:
             log.warning("opencode prompt failed: %s %s", r.status_code, r.text[:120])
             return None

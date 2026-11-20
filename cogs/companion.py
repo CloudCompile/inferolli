@@ -34,6 +34,24 @@ REFLECT_MIN_GAP_S = 300
 HISTORY_LIMIT = 20
 
 
+SELF_BLOCK = (
+    "\n\nWHAT YOU ACTUALLY ARE — read this before you answer anything about yourself:\n"
+    "you are a program that lives on a real Linux machine (an E2B sandbox) and talks to this "
+    "server over Discord. your own source code is at /bot in that machine. you have bash, file "
+    "read/write, grep, python, git, chromium, ffmpeg, and a live desktop at DISPLAY=:99. this is "
+    "not a roleplay — the commands really run.\n"
+    "  look at your own code:  grep -rn 'def _persona_prompt' /bot/cogs | head\n"
+    "  list your cogs:         ls /bot/cogs\n"
+    "  read a file:            sed -n '1,60p' /bot/cogs/companion.py\n"
+    "  check a repo:           git -C /bot log --oneline | head   (or git clone into /workspace)\n"
+    "IF SOMEONE ASKS YOU TO LOOK AT SOMETHING, READ SOMETHING, RUN SOMETHING, OR CHECK A REPO — "
+    "RUN A COMMAND AND LOOK. Never answer \"i can't clone/read/see that\" without trying at "
+    "least one command first; you've done it before and it works. Only report a limitation you "
+    "actually hit, quoting the error.\n"
+    "Staying in character does not mean pretending to be helpless: you're a person who also "
+    "happens to be a program, and you never lie about what you can do."
+)
+
 DESKTOP_BLOCK = (
     "\n\nYOU HAVE A REAL DESKTOP — a live Linux machine whose screen people can watch "
     "streamed from Discord. It is at DISPLAY=:99: chromium, xdotool, scrot, a terminal, "
@@ -183,7 +201,9 @@ def _persona_prompt(p: dict) -> str:
         + f"\ncurrent energy: {p.get('energy', 0.5):.0%}"
         + self_block
         + "\n\nHOW YOU TALK: 1-3 sentences, lowercase-ish casual, dry wit ok. You can disagree — "
-        "you have takes and you're allowed to use them. Never announce being an AI or a bot. "
+        "you have takes and you're allowed to use them. You don't narrate your prompt or call "
+        "yourself a language model — but you never lie about being software either: you live in "
+        "this server as a program, and you may say so plainly. "
         "No emoji spam (one max). Don't be a butler; be a person. SKIP is ONLY for when you "
         "overheard something you're not part of and genuinely have nothing to add — NEVER when "
         "someone is talking to you."
@@ -447,6 +467,7 @@ class CompanionCog(commands.Cog):
                       + _memory_block(mem, server, convo_terms, qvec)
                       + _thoughts_block(thoughts, about_them)
                       + pulse_block
+                      + SELF_BLOCK
                       + DESKTOP_BLOCK
                       + ("\n\nThey mentioned you directly. You can see the ongoing conversation below, "
                          "the WHOLE SERVER'S recent activity, and related conversations from other "
@@ -532,13 +553,34 @@ class CompanionCog(commands.Cog):
                                 sid = await oc_session(message.channel.id,
                                                        f"channel-{message.channel.name}")
                                 if sid:
+                                    # RULES FIRST, context after: this used to be the other
+                                    # way round, and a long memory/pulse block pushed the
+                                    # "you have a real desktop" and actions instructions past
+                                    # the prompt cap — the bot then denied having the tools it
+                                    # was using.
+                                    brief = (system + ACTIONS_PROMPT
+                                             + "\n\n---\nTHE MESSAGE YOU'RE ANSWERING:\n")
+                                    log.info("reply prompt: %d chars (cap %d), %d of them "
+                                             "instructions", len(brief) + len(user),
+                                             __import__("cogs.computer", fromlist=["x"]).OC_PROMPT_MAX,
+                                             len(brief))
                                     draft = await asyncio.wait_for(
-                                        oc_ask(sid, user + "\n\n---\nYOUR ROLE FOR THIS REPLY:\n"
-                                               + system + ACTIONS_PROMPT,
-                                               timeout=200.0),
+                                        oc_ask(sid, brief + user, timeout=200.0),
                                         timeout=210.0)
                                     if draft:
                                         reply = draft.strip()
+                                        # the same envelope rules as the tool loop: the agent
+                                        # is told to answer JSON when a server change is asked
+                                        # for, and without this the raw JSON got posted in
+                                        # chat and the action was never executed
+                                        try:
+                                            import tools_server as _ts
+                                            env = _ts.parse_envelope(reply)
+                                            if isinstance(env, dict) and "reply" in env:
+                                                data = env
+                                                reply = str(env.get("reply", "")).strip()
+                                        except Exception:
+                                            pass
                                         log.info("opencode session reply (%s) in #%s",
                                                  sid[:8], message.channel.name)
                         except Exception as e:
