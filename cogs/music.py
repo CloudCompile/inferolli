@@ -542,13 +542,19 @@ async def _nudge_player() -> str:
     except Exception:
         return ""
     try:
-        if np.get("isPlaying") is False:
+        if np.get("isPlaying") is False and np.get("id"):
             await _post("/playback/play")
             return "resumed the player"
         song = np.get("id")
+        if not song:
+            # Nothing is loaded at all. The queue outlives a stop, so start
+            # what was lined up instead of resuming into silence.
+            queue = await _get("/playback/queue")
+            items = queue.get("items") or []
+            song = items[0].get("id") if items else None
         if song:
             await _post(f"/playback/play-song/{song}")
-            return "restarted the track"
+            return "restarted the track" if np.get("id") else "started the queued track"
     except StudioError:
         log.debug("nudge refused", exc_info=True)
     return ""

@@ -315,6 +315,34 @@ class NudgeTests(unittest.TestCase):
         self.assertEqual(posted, ["/playback/play-song/617154366"])
 
 
+    def test_an_empty_player_starts_what_was_queued(self):
+        """Nothing loaded, nothing playing: 'resume' resumes silence."""
+        posted = []
+
+        async def get(path, **kw):
+            if path.endswith("/queue"):
+                return {"items": [{"id": "617154366", "title": "Get Lucky"}]}
+            return {"isPlaying": False, "id": None}
+
+        async def post(path, **kw):
+            posted.append(path)
+            return {}
+
+        with mock.patch.object(music, "_get", mock.Mock(side_effect=get)), \
+             mock.patch.object(music, "_post", mock.Mock(side_effect=post)):
+            self.assertIn("queued", self.run_async(music._nudge_player()))
+        self.assertEqual(posted, ["/playback/play-song/617154366"])
+
+    def test_an_empty_queue_gives_up_quietly(self):
+        async def get(path, **kw):
+            return {"items": []} if path.endswith("/queue") else {"isPlaying": False}
+
+        with mock.patch.object(music, "_get", mock.Mock(side_effect=get)), \
+             mock.patch.object(music, "_post", mock.Mock()) as post:
+            self.assertEqual(self.run_async(music._nudge_player()), "")
+        post.assert_not_called()
+
+
 class SelfHealTests(unittest.TestCase):
     def test_watcher_restarts_a_stopped_stream(self):
         guild = FakeGuild()
