@@ -37,6 +37,16 @@ class StartShTests(unittest.TestCase):
     def test_only_idles_without_any_credentials(self):
         self.assertIn('if [ ! -s /bot/.env ]', self.text)
 
+    def test_an_empty_env_keeps_waiting_before_idling(self):
+        """A drill measured the keeper's /bot/.env write landing 4.5 minutes
+        after boot (the SDK connect retried until the sandbox was ready).
+        Idling at the first empty check would kill the sandbox the keeper just
+        created."""
+        wait = self.text.index("while [ ! -s /bot/.env ]")
+        idle = self.text.index("exec sleep infinity")
+        self.assertLess(wait, idle)
+        self.assertIn('"$WAITED" -lt 600', self.text)
+
     def test_rebuilds_when_any_credential_is_present(self):
         """A drill passed only the S3 keys. The gate demanded a Discord token,
         so nothing was rebuilt and the sandbox waited out the whole loop."""
@@ -57,7 +67,10 @@ class StartShTests(unittest.TestCase):
         first_bootstrap = self.text.index("rebuild_env_from_environment\nfi")
         wait_loop = self.text.index("while [ ! -f /bot/.env ]")
         self.assertLess(first_bootstrap, wait_loop)
-        self.assertNotIn("WAITED\" -lt 600", self.text)
+        # the wait BEFORE bootstrap stays short; only the secrets-in-flight wait
+        # after it may be long
+        self.assertLess(self.text.index('"$WAITED" -lt 120'),
+                        self.text.index('"$WAITED" -lt 600'))
 
     def test_restores_backup_before_booting(self):
         restore = self.text.index("restore_latest")

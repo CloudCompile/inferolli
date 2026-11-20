@@ -54,8 +54,18 @@ while [ ! -f /bot/.env ] && [ "$WAITED" -lt 120 ]; do
 done
 [ -f /bot/.env ] || rebuild_env_from_environment
 
+# --- an EMPTY .env means the secrets may still be in flight. A keeper-created
+#     sandbox gets /bot/.env written seconds after create, but the SDK's
+#     connect can retry for minutes before the sandbox accepts files (a real
+#     drill measured 4.5 minutes). Idling at the first empty check would
+#     quietly kill exactly the sandbox the keeper just paid for. ---
+WAITED=0
+while [ ! -s /bot/.env ] && [ "$WAITED" -lt 600 ]; do
+  sleep 5
+  WAITED=$((WAITED + 5))
+done
 if [ ! -s /bot/.env ]; then
-  echo "[start] no .env and no credentials in the environment — idling"
+  echo "[start] no credentials arrived in 10 minutes — idling"
   exec sleep infinity
 fi
 set -a; . /bot/.env; set +a
