@@ -153,6 +153,39 @@ fi
 
 # --- the stack watchdog: any dead piece gets revived (children of the start
 #     command survive; nothing exec-launched does — so this is the healer) ---
+ensure_tunnel() {
+  # A quick tunnel DIES whenever the sandbox pauses (cloudflare reaps it), and
+  # on resume cloudflared retries the dead tunnel id forever —
+  # "Unauthorized: Tunnel not found" — while pgrep reports it perfectly alive.
+  # So the test is whether the tunnel's URL still answers /health, not whether
+  # the process exists. After any pause the watchdog mints a fresh URL here.
+  local tun launch grace
+  if ! pgrep -x cloudflared >/dev/null 2>&1; then
+    launch=1
+  else
+    tun="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log 2>/dev/null | tail -1)"
+    if [ -n "$tun" ]; then
+      if curl -s --max-time 6 "$tun/health" 2>/dev/null | grep -q '"ok"'; then
+        launch=0
+      else
+        launch=1
+      fi
+    else
+      # no URL yet: fine for the first ~90s of a launch (handshake), dead after
+      grace=$(( $(date +%s) - $(cat /tmp/cloudflared.started 2>/dev/null || echo 0) ))
+      if [ "$grace" -gt 90 ]; then launch=1; else launch=0; fi
+    fi
+  fi
+  if [ "$launch" = 1 ]; then
+    pkill -x cloudflared 2>/dev/null
+    sleep 1
+    : > /tmp/cloudflared.log
+    date +%s > /tmp/cloudflared.started
+    (nohup cloudflared tunnel --url http://localhost:8080 --no-autoupdate \
+      > /tmp/cloudflared.log 2>&1 &)
+  fi
+}
+
 (while true; do
   sleep 30
   pgrep -f 'Xvfb :99' >/dev/null || { Xvfb :99 -screen 0 1440x900x24 -nolisten tcp > /dev/null 2>&1 & sleep 2; }
@@ -162,8 +195,7 @@ fi
   }
   pgrep -f 'uvicorn desktop_gate' >/dev/null || \
     (nohup python3 -m uvicorn desktop_gate:app --host 127.0.0.1 --port 8080 > /tmp/gate.log 2>&1 &)
-  pgrep -f 'cloudflared tunnel' >/dev/null || \
-    (nohup cloudflared tunnel --url http://localhost:8080 --no-autoupdate > /tmp/cloudflared.log 2>&1 &)
+  ensure_tunnel
   pgrep -f 'opencode serve' >/dev/null || \
     (nohup opencode serve --port 4096 > /tmp/opencode-serve.log 2>&1 &)
 done > /dev/null 2>&1 &)

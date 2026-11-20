@@ -81,7 +81,15 @@ class StartShTests(unittest.TestCase):
         self.assertIn("while true; do", self.text)
         self.assertIn("pgrep -f 'opencode serve'", self.text)
         self.assertIn("pgrep -f 'uvicorn desktop_gate'", self.text)
-        self.assertIn("pgrep -f 'cloudflared tunnel'", self.text)
+        # the tunnel check is a HEALTH check, not a liveness check: a paused
+        # sandbox gets its quick tunnel reaped and cloudflared retries the dead
+        # id forever while pgrep says it's alive
+        self.assertIn("ensure_tunnel", self.text)
+        fn = self.text[self.text.index("ensure_tunnel() {"):]
+        fn = fn[:fn.index("\n}\n")]
+        self.assertIn("trycloudflare", fn)
+        self.assertIn("/health", fn)
+        self.assertIn("pkill -x cloudflared", fn)
         self.assertIn("pgrep -f 'Xvfb :99'", self.text)
 
     def test_no_fixed_opencode_password_is_exported(self):

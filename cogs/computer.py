@@ -298,17 +298,26 @@ class ComputerCog(commands.Cog):
             await asyncio.sleep(8)
 
         url = ""
-        for _ in range(6):
+        for _ in range(4):
             # tail, not head: the log can hold an older (dead) URL above the live one
             r = await run("grep -oE 'https://[a-z0-9-]+\\.trycloudflare\\.com' /tmp/cloudflared.log | tail -1")
             url = r.stdout.strip()
             if url:
-                # prove the tunnel actually reaches the gate before handing it out
+                # prove the tunnel actually reaches the gate before handing it out.
+                # pgrep alone is not a health check: a paused sandbox gets its
+                # quick tunnel reaped, and cloudflared then retries the dead id
+                # forever ("Tunnel not found") while looking perfectly alive.
                 h = await run(f"curl -s --max-time 8 {url}/health")
                 if "ok" in h.stdout:
                     break
                 url = ""
-            await asyncio.sleep(3)
+            # no working URL: mint a fresh tunnel (wipe the log so the dead
+            # URL can't be handed back out)
+            await run("pkill -x cloudflared 2>/dev/null; sleep 1; "
+                      ": > /tmp/cloudflared.log; date +%s > /tmp/cloudflared.started; "
+                      "(nohup cloudflared tunnel --url http://localhost:8080 "
+                      "--no-autoupdate > /tmp/cloudflared.log 2>&1 &)", timeout=40)
+            await asyncio.sleep(8)
         if not url:
             return await interaction.followup.send(
                 f"tunnel didn't come up: {(r.stderr or r.stdout)[:150]}")
