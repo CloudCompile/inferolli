@@ -46,6 +46,10 @@ jobs:
         with:
           python-version: "3.12"
 
+      # only creation needs it (to write /bot/.env into the sandbox — creation
+      # envs no longer reach the start command). Resume/extend never import it.
+      - run: pip install e2b
+
       - name: extend, resume, or create
         env:
           E2B_API_KEY: ${{ secrets.E2B_API_KEY }}

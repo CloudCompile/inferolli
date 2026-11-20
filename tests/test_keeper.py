@@ -154,24 +154,73 @@ class CreateTests(unittest.TestCase):
         with mock.patch.dict("os.environ", {"DISCORD_BOT_TOKEN": ""}, clear=False):
             self.assertFalse(keeper.can_create())
 
-    def test_creation_passes_every_secret_through_the_environment(self):
-        sent = {}
+    def test_creation_writes_the_secrets_in_as_a_file(self):
+        """Creation envs stopped reaching the start command (verified
+        2026-11-20), so the secrets ride in as /bot/.env via the SDK."""
+        import sys, types
+        written = {}
+
+        class FakeFiles:
+            @staticmethod
+            def write(path, data):
+                written[path] = data
+
+        class FakeSandbox:
+            files = FakeFiles()
+
+            @staticmethod
+            def connect(sid):
+                return FakeSandbox()
+
+        fake_e2b = types.SimpleNamespace(Sandbox=FakeSandbox)
 
         def fake_req(method, path, key, body=None, params=None, timeout=30):
             if path == "/v2/sandboxes":
                 return 200, []
-            sent["body"] = body
             return 201, {"sandboxID": "brandnew00000001"}
 
         with mock.patch.dict("os.environ", self.BUNDLE, clear=False), \
-             mock.patch.object(keeper, "_req", fake_req):
+             mock.patch.object(keeper, "_req", fake_req), \
+             mock.patch.dict(sys.modules, {"e2b": fake_e2b}):
             report = keeper.run_once("k")
         self.assertEqual(report["created"], "brandnew00000001")
-        env = sent["body"]["envVars"]
+        env_file = written["/bot/.env"].decode()
         for k in ("DISCORD_BOT_TOKEN", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY"):
-            self.assertEqual(env[k], self.BUNDLE[k])
-        self.assertEqual(sent["body"]["templateID"], keeper.TEMPLATE_ID)
-        self.assertTrue(sent["body"]["autoPause"])
+            self.assertIn(f"{k}={self.BUNDLE[k]}", env_file)
+        self.assertEqual(written["/bot/.e2b-sandbox-id"], "brandnew00000001")
+
+    def test_env_values_with_spaces_get_quoted(self):
+        text = keeper.env_text({"A": "plain", "B": "two words", "C": "it's"})
+        self.assertIn("A=plain\n", text)
+        self.assertIn("B='two words'\n", text)
+        # a quote inside the value must not break `set -a; . .env`
+        c_line = [ln for ln in text.splitlines() if ln.startswith("C=")][0]
+        self.assertTrue(c_line.startswith("C='"))
+        self.assertNotIn("C=it's", text)
+
+    def test_create_without_the_sdk_says_so(self):
+        import sys
+
+        def fake_req(method, path, key, body=None, params=None, timeout=30):
+            if path == "/v2/sandboxes":
+                return 200, []
+            return 201, {"sandboxID": "brandnew00000001"}
+
+        with mock.patch.dict("os.environ", self.BUNDLE, clear=False), \
+             mock.patch.object(keeper, "_req", fake_req), \
+             mock.patch.dict(sys.modules, {"e2b": None}):
+            import builtins
+            real_import = builtins.__import__
+
+            def no_e2b(name, *a, **k):
+                if name == "e2b":
+                    raise ImportError("no e2b here")
+                return real_import(name, *a, **k)
+
+            with mock.patch("builtins.__import__", side_effect=no_e2b):
+                report = keeper.run_once("k")
+        self.assertIsNone(report["created"])
+        self.assertIn("pip install e2b", report["failed"][0][1])
 
     def test_a_failed_create_is_reported_not_raised(self):
         def fake_req(method, path, key, body=None, params=None, timeout=30):

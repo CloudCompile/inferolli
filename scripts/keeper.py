@@ -78,13 +78,20 @@ SECRET_KEYS = (
 
 
 def boot_env() -> dict:
-    """The secrets a brand-new sandbox needs, taken from this process.
-
-    Creation envs DO reach the start command (verified on a real sandbox), so a
-    created sandbox can rebuild its own /bot/.env and boot with nobody writing
-    files into it.
-    """
+    """The secrets a brand-new sandbox needs, taken from this process."""
     return {k: os.environ[k] for k in SECRET_KEYS if os.environ.get(k)}
+
+
+def env_text(env: dict) -> str:
+    """The /bot/.env file for a fresh sandbox. `set -a; . .env` must parse it,
+    so any value with spaces or shell metacharacters gets quoted."""
+    lines = []
+    for k, v in env.items():
+        v = str(v)
+        if not v or any(c in v for c in " \t\n'\"$&|;<>()`"):
+            v = "'" + v.replace("'", "'\\''") + "'"
+        lines.append(f"{k}={v}")
+    return "\n".join(lines) + "\n"
 
 
 def can_create() -> bool:
@@ -94,15 +101,37 @@ def can_create() -> bool:
 
 
 def create(key: str) -> dict:
+    """Create a sandbox AND hand it its secrets.
+
+    Creation envs used to reach the start command; re-verified 2026-11-20 and
+    they no longer do (both /sandboxes + envVars and /v2/sandboxes + envs
+    deliver nothing to it — only exec sessions see them). So the secrets go in
+    as a FILE, through the e2b SDK, which is the one channel that can write
+    into a sandbox from outside. start.sh's wait loop watches for /bot/.env,
+    so this lands before it gives up.
+
+    The SDK is deliberately imported here, not at the top: the resume/extend
+    path must work without it (nothing to install on a thin cron box), and only
+    creation needs the extra dependency.
+    """
+    try:
+        import e2b
+    except ImportError as e:
+        raise RuntimeError("creating needs the e2b SDK (pip install e2b) "
+                           "to write /bot/.env into the sandbox") from e
+    env = boot_env()
     status, body = _req("POST", "/sandboxes", key, {
         "templateID": TEMPLATE_ID,
         "timeout": WINDOW_S,
         "autoPause": True,
-        "envVars": boot_env(),
         "metadata": {"role": "primary", "createdBy": "keeper"},
     }, timeout=120)
     if status not in (200, 201) or not isinstance(body, dict):
         raise RuntimeError(f"create failed: HTTP {status}")
+    sid = body.get("sandboxID")
+    sbx = e2b.Sandbox.connect(sid)
+    sbx.files.write("/bot/.e2b-sandbox-id", sid)
+    sbx.files.write("/bot/.env", env_text(env).encode())
     return body
 
 
