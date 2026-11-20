@@ -68,6 +68,23 @@ python -c "from cogs.backup import restore_latest; print('[start]', restore_late
 set -a; . /bot/.env; set +a
 slog "brain restored: .env=$(wc -c < /bot/.env 2>/dev/null || echo 0) bytes"
 
+# --- its own source, versioned: the canonical repo is public, so a plain clone
+#     needs no credentials. /bot is the RUNNING copy — live, unversioned, and
+#     it is what is actually executing; this clone is the reference copy it can
+#     git log / blame / diff against. Never fatal: a sandbox without network
+#     to github still boots the bot. ---
+mkdir -p /workspace
+slog "cloning the source repo..."
+if [ -d /workspace/inferolli/.git ]; then
+  git -C /workspace/inferolli pull --ff-only >/dev/null 2>&1 \
+    || git -C /workspace/inferolli fetch --depth 100 origin >/dev/null 2>&1 || true
+else
+  rm -rf /workspace/inferolli
+  git clone --depth 100 https://github.com/InferencePort-AI/inferolli.git \
+    /workspace/inferolli >/dev/null 2>&1 || true
+fi
+slog "source repo: $(git -C /workspace/inferolli log --oneline -1 2>/dev/null || echo 'clone unavailable')"
+
 # --- the desktop display: Xvfb on :99, XFCE4 riding on it ---
 Xvfb :99 -screen 0 1440x900x24 -nolisten tcp > /dev/null 2>&1 &
 export DISPLAY=:99

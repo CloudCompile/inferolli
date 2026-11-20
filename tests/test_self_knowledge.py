@@ -17,6 +17,7 @@ truncated at 6000 chars and the instructions were appended AFTER the memory and
 server-pulse blocks.
 """
 
+import pathlib
 import unittest
 from unittest import mock
 
@@ -30,6 +31,24 @@ class SelfKnowledgeTests(unittest.TestCase):
         self.assertIn("/bot", block)
         for tool in ("bash", "git", "chromium", "grep"):
             self.assertIn(tool, block)
+
+    def test_it_sees_both_copies_of_its_source(self):
+        """The running copy (/bot) and the versioned repo clone
+        (/workspace/inferolli) are different things with different powers."""
+        block = companion.SELF_BLOCK
+        self.assertIn("/workspace/inferolli", block)
+        self.assertIn("log --oneline", block)
+        self.assertIn("git blame", block)
+        # inspect, don't rewrite the running engine
+        self.assertIn("don't rewrite", block)
+
+    def test_start_sh_clones_the_source_repo(self):
+        text = pathlib.Path("start.sh").read_text()
+        self.assertIn("git clone", text)
+        self.assertIn("github.com/InferencePort-AI/inferolli", text)
+        # a github outage must not stop the bot from booting
+        self.assertIn("|| true", text)
+        self.assertIn("clone unavailable", text)
 
     def test_it_is_forbidden_to_claim_helplessness_without_trying(self):
         block = companion.SELF_BLOCK.lower()
