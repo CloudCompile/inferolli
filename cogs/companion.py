@@ -63,7 +63,11 @@ DESKTOP_BLOCK = (
     "type, or 'use the computer', ACTUALLY DO IT with your bash tool — they see it happen "
     "live. Never say you can't; you can.\n"
     "  open a page:    DISPLAY=:99 chromium --no-sandbox --start-maximized "
-    "--user-data-dir=/workspace/chrome-profile URL > /tmp/chromium.log 2>&1 &\n"
+    "--user-data-dir=/workspace/chrome-profile "
+    "--use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader "
+    "--ignore-gpu-blocklist URL > /tmp/chromium.log 2>&1 &\n"
+    "    (the GL flags are REQUIRED: there is no GPU in here, and without them chromium "
+    "blocklists WebGL and the page dies with 'no hardware acceleration')\n"
     "  search on screen: open https://www.google.com/search?q=YOUR+QUERY (fallback if Google "
     "blocks: https://duckduckgo.com/?q=YOUR+QUERY)\n"
     "  type / keys:    DISPLAY=:99 xdotool type --delay 40 'text'   ·   xdotool key Return ctrl+l\n"
@@ -126,8 +130,13 @@ def _run_screen_errand(url: str, settle: float = 14.0) -> str | None:
     import os
     import subprocess
     os.makedirs(OUTBOX, exist_ok=True)
-    chrome = ("chromium --no-sandbox --disable-gpu --start-maximized "
-              "--user-data-dir=/workspace/chrome-profile")
+    # NO --disable-gpu here: this box has no GPU, and that flag makes chromium
+    # blocklist WebGL entirely — a GPU-dependent page then renders an error card
+    # instead of itself. SwiftShader (software GL) is what makes WebGL work.
+    chrome = ("chromium --no-sandbox --start-maximized "
+              "--user-data-dir=/workspace/chrome-profile "
+              "--use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader "
+              "--ignore-gpu-blocklist")
     try:
         subprocess.run(f"{chrome} '{url}' > /tmp/chromium.log 2>&1 &", shell=True,
                        timeout=20, env={**os.environ, "DISPLAY": ":99"})

@@ -65,6 +65,27 @@ class SelfKnowledgeTests(unittest.TestCase):
     def test_the_desktop_block_still_promises_it_can_act(self):
         self.assertIn("Never say you can't", companion.DESKTOP_BLOCK)
 
+    def test_chromium_recipes_enable_software_gl(self):
+        """There is no GPU in the sandbox. Chromium 156 blocklists WebGL without
+        SwiftShader, so GPU pages (gd-webport died on this) render an error
+        card: 'no hardware acceleration'. Every launch recipe must carry the
+        software-GL flags, and none may pass --disable-gpu."""
+        import re
+        src = pathlib.Path("cogs/companion.py").read_text()
+        for needle in ("--use-angle=swiftshader", "--enable-unsafe-swiftshader"):
+            # the agent's recipe in DESKTOP_BLOCK
+            self.assertIn(needle, companion.DESKTOP_BLOCK)
+            # the deterministic screen errand
+            errand = src[src.index("def _run_screen_errand"):src.index("def _wants_to_join")]
+            self.assertIn(needle, errand)
+        # the command line itself must not pass it (the comment above it does)
+        chrome_line = [ln for ln in errand.splitlines() if ln.strip().startswith("chrome = (")][0]
+        chrome_cmd = "".join(errand.splitlines()[errand.splitlines().index(chrome_line):
+                                              errand.splitlines().index(chrome_line) + 4])
+        self.assertNotIn("--disable-gpu", chrome_cmd)
+        computer_src = pathlib.Path("cogs/computer.py").read_text()
+        self.assertIn("--enable-unsafe-swiftshader", computer_src)
+
 
 class PromptTruncationTests(unittest.TestCase):
     def test_prompt_cap_fits_the_instructions(self):

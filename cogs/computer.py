@@ -263,7 +263,11 @@ class ComputerCog(commands.Cog):
         result = await asyncio.get_event_loop().run_in_executor(None, lambda: _run(
             # any chromium-family browser (the image ships chromium; chrome if present)
             f"B=$(command -v google-chrome || command -v chromium || command -v chromium-browser); "
-            f"$B --headless=new --no-sandbox --disable-gpu --window-size=1280,1400 "
+            # software GL so WebGL pages screenshot properly (no GPU in this box;
+            # --disable-gpu would blocklist WebGL and render an error card)
+            f"$B --headless=new --no-sandbox --window-size=1280,1400 "
+            f"--use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader "
+            f"--ignore-gpu-blocklist "
             f"--screenshot=/workspace/shot.png --virtual-time-budget=8000 '{url}' 2>&1 | tail -1",
             60, WORKSPACE))
         try:
