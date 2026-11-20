@@ -39,6 +39,11 @@ class FakeProc:
             return self._chunks.pop(0)
         return b""
 
+    def read1(self, n):
+        if self._chunks:
+            return self._chunks.pop(0)[:n]
+        return b""
+
     def kill(self):
         self.killed = True
 
@@ -74,6 +79,48 @@ class StudioAudioTests(unittest.TestCase):
             source.read()
         self.assertTrue(source.sounding())
         self.assertEqual(source.silent_frames, 0)
+
+    def test_a_suspended_monitor_gives_silence_not_a_dead_stream(self):
+        """PulseAudio sends a suspended sink's monitor NOTHING — not silence.
+
+        Blocking there is how the bot ended up in the channel sending no
+        packets at all while every flag it checked said "playing".
+        """
+        source, _ = self._source()
+        with mock.patch.object(music.StudioAudio, "_ready", return_value=False):
+            frame = source.read()
+        self.assertEqual(len(frame), music.FRAME)
+        self.assertEqual(frame, b"\x00" * music.FRAME)
+        self.assertEqual(source.frames, 1)
+        self.assertEqual(source.stalled_frames, 1)
+        self.assertEqual(source.silent_frames, 1)
+        self.assertFalse(source.dead)
+        self.assertFalse(source.sounding())
+
+    def test_dead_air_accumulates_so_the_watchdog_can_see_it(self):
+        source, _ = self._source()
+        with mock.patch.object(music.StudioAudio, "_ready", return_value=False):
+            for _ in range(50):
+                source.read()
+        self.assertAlmostEqual(source.silent_seconds(), 1.0)
+        self.assertEqual(source.stalled_frames, 50)
+
+    def test_sound_after_dead_air_clears_the_silence_counter(self):
+        loud = b"\x01\x00" * (music.FRAME // 2)
+        source, _ = self._source(loud)
+        with mock.patch.object(music.StudioAudio, "_ready", return_value=False):
+            source.read()
+        source.read()
+        self.assertTrue(source.sounding())
+        self.assertEqual(source.silent_frames, 0)
+        self.assertEqual(source.stalled_frames, 1)
+
+    def test_partial_chunks_are_assembled_into_a_whole_frame(self):
+        half = b"\x01\x00" * (music.FRAME // 4)
+        source, _ = self._source(half, half)
+        frame = source.read()
+        self.assertEqual(len(frame), music.FRAME)
+        self.assertTrue(source.sounding())
 
     def test_eof_marks_the_source_dead(self):
         source, _ = self._source()
@@ -155,6 +202,7 @@ class AttachTests(unittest.TestCase):
         source.dead = False
         source.mode = "pulse"
         source.silent_frames = 0
+        source.stalled_frames = 0
         source.cleanup = mock.Mock()
         return source
 
@@ -298,6 +346,81 @@ class SelfHealTests(unittest.TestCase):
         self.assertEqual(restarts, [vc])
 
 
+class DeadAirTests(unittest.TestCase):
+    """is_playing() is true while a stalled source sends nothing at all."""
+
+    class StalledStudio(music.StudioAudio):
+        def __init__(self, silent_seconds=12.0):
+            self.frames = 500
+            self.silent_frames = int(silent_seconds / 0.02)
+            self.stalled_frames = 10
+            self.dead = False
+            self.mode = "pulse"
+
+        def cleanup(self):
+            pass
+
+    def test_the_watcher_restarts_dead_air(self):
+        guild = FakeGuild()
+        vc = mock.Mock()
+        vc.is_playing.return_value = True  # discord.py thinks all is well
+        vc.channel = mock.Mock(name="vc-channel")
+        vc.source = self.StalledStudio()
+        guild.voice_client = vc
+
+        restarts = []
+
+        async def start_stream(_self, client):  # patched on the class -> bound
+            restarts.append(client)
+            return None
+
+        async def fake_sleep(_seconds):
+            guild.voice_client = None  # one pass, then leave the loop
+
+        async def now_playing(path, **params):
+            return {}
+
+        cog = music.MusicCog(bot=mock.Mock())
+        cog.bot.wait_until_ready = mock.AsyncMock()
+        with mock.patch.object(music, "_get", mock.Mock(side_effect=now_playing)), \
+             mock.patch("cogs.music.asyncio.sleep", fake_sleep), \
+             mock.patch("discord.utils.get", mock.Mock(return_value=None)), \
+             mock.patch.object(music.MusicCog, "_start_stream", start_stream):
+            asyncio.run(cog._np_watcher(guild))
+
+        self.assertEqual(restarts, [vc])
+
+    def test_short_dips_in_sound_are_left_alone(self):
+        guild = FakeGuild()
+        vc = mock.Mock()
+        vc.is_playing.return_value = True
+        vc.channel = mock.Mock(name="vc-channel")
+        vc.source = self.StalledStudio(silent_seconds=2.0)
+        guild.voice_client = vc
+
+        restarts = []
+
+        async def start_stream(_self, client):
+            restarts.append(client)
+            return None
+
+        async def fake_sleep(_seconds):
+            guild.voice_client = None
+
+        async def now_playing(path, **params):
+            return {}
+
+        cog = music.MusicCog(bot=mock.Mock())
+        cog.bot.wait_until_ready = mock.AsyncMock()
+        with mock.patch.object(music, "_get", mock.Mock(side_effect=now_playing)), \
+             mock.patch("cogs.music.asyncio.sleep", fake_sleep), \
+             mock.patch("discord.utils.get", mock.Mock(return_value=None)), \
+             mock.patch.object(music.MusicCog, "_start_stream", start_stream):
+            asyncio.run(cog._np_watcher(guild))
+
+        self.assertEqual(restarts, [])
+
+
 class CommandNameTests(unittest.TestCase):
     def test_resume_uses_the_real_tonearm_command(self):
         """tonearm accepts play|pause|toggle|next|previous — /resume used to
@@ -333,3 +456,63 @@ class PulseEnvTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True), \
              mock.patch.object(music.os.path, "isdir", return_value=False):
             self.assertNotIn("XDG_RUNTIME_DIR", music._pulse_env())
+
+
+class ToneTests(unittest.TestCase):
+    """/voicecheck's tone: it exists so the bot can be tested without the studio."""
+
+    def test_a_frame_is_20ms_of_stereo_pcm(self):
+        tone = music.ToneSource(seconds=0.1)
+        self.assertEqual(len(tone.read()), music.FRAME)
+
+    def test_the_tone_is_actually_audible(self):
+        import array
+        tone = music.ToneSource(seconds=0.5)
+        samples = array.array("h", tone.read())
+        self.assertGreater(max(abs(s) for s in samples), 1000)
+
+    def test_it_stops_after_its_duration(self):
+        tone = music.ToneSource(seconds=0.04)  # exactly two frames
+        self.assertEqual(len(tone.read()), music.FRAME)
+        self.assertEqual(len(tone.read()), music.FRAME)
+        self.assertEqual(tone.read(), b"")
+        self.assertTrue(tone.dead)
+
+    def test_full_level_does_not_clip(self):
+        import array
+        tone = music.ToneSource(seconds=0.5, level=1.0)
+        samples = array.array("h", tone.read())
+        self.assertLessEqual(max(abs(s) for s in samples), 32767)
+
+    def test_level_controls_amplitude(self):
+        import array
+        quiet = array.array("h", music.ToneSource(seconds=0.5, level=0.1).read())
+        loud = array.array("h", music.ToneSource(seconds=0.5, level=0.5).read())
+        self.assertLess(max(abs(s) for s in quiet), max(abs(s) for s in loud))
+
+    def test_the_phase_carries_over_between_frames(self):
+        """A restart at zero every frame is a 50 Hz buzz, not a tone."""
+        import array
+        tone = music.ToneSource(seconds=0.1)
+        first = array.array("h", tone.read())
+        second = array.array("h", tone.read())
+        self.assertLess(abs(first[-1] - second[0]), 32767 // 4)
+
+
+class SinkWakeTests(unittest.TestCase):
+    """A suspended sink is indistinguishable from a dead studio, so wake it."""
+
+    def test_wakes_the_named_sink(self):
+        with mock.patch.object(music.subprocess, "run", mock.Mock()) as run:
+            music._wake_sink("tonearm_audio")
+        self.assertEqual(run.call_args[0][0],
+                         ["pactl", "suspend-sink", "tonearm_audio", "0"])
+
+    def test_no_sink_is_a_no_op(self):
+        with mock.patch.object(music.subprocess, "run", mock.Mock()) as run:
+            music._wake_sink(None)
+        run.assert_not_called()
+
+    def test_a_missing_pactl_does_not_raise(self):
+        with mock.patch.object(music.subprocess, "run", mock.Mock(side_effect=FileNotFoundError)):
+            music._wake_sink("tonearm_audio")  # must not raise

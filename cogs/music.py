@@ -22,10 +22,13 @@ While a voice party is active, track changes are posted to the
 🎧│listening-post channel (auto-created by admins via abilities).
 """
 
+import array
 import asyncio
 import json
 import logging
+import math
 import os
+import select
 import subprocess
 import time
 from pathlib import Path
@@ -335,6 +338,12 @@ async def _song_ids(kind: str, rid: str) -> list[str]:
 
 # 20 ms of 48 kHz stereo s16 — one Discord voice frame.
 FRAME = 3840
+# How long one frame may take to arrive before we call the capture stalled.
+# PulseAudio gives a *suspended* sink's monitor nothing at all — not silence —
+# so without this the read blocks forever and the bot stops sending audio.
+# Short enough that dead air still goes out at roughly Discord's frame rate
+# (a stalled frame is emitted as silence rather than collapsing the stream).
+READ_TIMEOUT = 0.06
 
 
 def _pulse_env() -> dict:
@@ -349,6 +358,24 @@ def _pulse_env() -> dict:
     if os.path.isdir(runtime):
         env["XDG_RUNTIME_DIR"] = runtime
     return env
+
+
+def _wake_sink(sink: str | None) -> None:
+    """Stop PulseAudio suspending the studio's sink.
+
+    A suspended sink's monitor delivers NO data — not a stream of silence —
+    so every client reading it blocks forever. That is how the bot ended up
+    sitting in a voice channel sending nothing at all while every flag it
+    checked said "playing": the read never returned, so no frame was ever
+    encoded, and nothing could notice.
+    """
+    if not sink:
+        return
+    try:
+        subprocess.run(["pactl", "suspend-sink", sink, "0"],
+                       capture_output=True, timeout=5, env=_pulse_env())
+    except Exception:
+        log.debug("could not wake the studio sink", exc_info=True)
 
 
 def _sink_name() -> str | None:
@@ -384,6 +411,8 @@ class StudioAudio(discord.AudioSource):
     def __init__(self, url: str = "", device: str | None = None):
         self.frames = 0
         self.silent_frames = 0
+        self.stalled_frames = 0
+        self._buf = b""
         self.dead = False
         self.mode = "pulse" if device else "http"
         if device:
@@ -397,11 +426,39 @@ class StudioAudio(discord.AudioSource):
                                       stdin=subprocess.DEVNULL,
                                       env=_pulse_env() if device else None)
 
+    def _ready(self, timeout: float) -> bool:
+        try:
+            return bool(select.select([self._proc.stdout], [], [], timeout)[0])
+        except Exception:
+            return True  # let the (blocking) read decide
+
     def read(self) -> bytes:
-        data = self._proc.stdout.read(FRAME)
-        if not data or len(data) < FRAME:
-            self.dead = True
+        """One 20 ms frame — always. Silence counts as a frame.
+
+        Returning b"" when the capture goes quiet would stop the player, and
+        the player stopping looks identical to the track ending. A silent
+        frame instead keeps Discord's timeline running and makes the dead air
+        measurable, so the watchdog can see it and restart the studio.
+        """
+        if self.dead:
             return b""
+        while len(self._buf) < FRAME:
+            if not self._ready(READ_TIMEOUT):
+                break
+            chunk = self._proc.stdout.read1(FRAME - len(self._buf))
+            if not chunk:
+                self.dead = True
+                return b""
+            self._buf += chunk
+        if len(self._buf) < FRAME:
+            missing = FRAME - len(self._buf)
+            self.frames += 1
+            self.silent_frames += 1
+            self.stalled_frames += 1
+            data = self._buf + b"\x00" * missing
+            self._buf = b""
+            return data
+        data, self._buf = self._buf[:FRAME], self._buf[FRAME:]
         self.frames += 1
         if data.count(b"\x00") == len(data):
             self.silent_frames += 1
@@ -426,6 +483,58 @@ class StudioAudio(discord.AudioSource):
             pass
 
 
+class ToneSource(discord.AudioSource):
+    """A plain 440 Hz tone, generated in-process — no studio involved.
+
+    The studio's audio goes through a browser, PulseAudio, a capture process
+    and a sink. This goes through none of them. So it separates two failures
+    that look identical from the outside ("i hear nothing"):
+
+    - tone audible, studio silent -> the bot's path into Discord is fine, the
+      fault is the studio's audio;
+    - tone NOT audible -> nothing the studio does matters, the packets are
+      leaving but not arriving (or not being decoded), and that's the bug.
+    """
+
+    def __init__(self, seconds: float = 6.0, hz: float = 440.0,
+                 level: float = 0.3):
+        self.total_frames = max(1, int(seconds / 0.02))
+        self.frames = 0
+        self.dead = False
+        self.mode = "tone"
+        self.silent_frames = 0
+        self._amp = int(32767 * max(0.0, min(1.0, level)))
+        self._phase = 0.0
+        self._step = 2.0 * math.pi * hz / 48000.0
+
+    def read(self) -> bytes:
+        if self.frames >= self.total_frames:
+            self.dead = True
+            return b""
+        self.frames += 1
+        buf = array.array("h")
+        phase, step, amp = self._phase, self._step, self._amp
+        for _ in range(FRAME // 4):  # stereo pairs in one 20 ms frame
+            sample = int(amp * math.sin(phase))
+            phase += step
+            buf.append(sample)
+            buf.append(sample)
+        self._phase = phase % (2.0 * math.pi)
+        return buf.tobytes()
+
+    def is_opus(self) -> bool:
+        return False
+
+    def sounding(self) -> bool:
+        return self.frames > 0
+
+    def silent_seconds(self) -> float:
+        return 0.0
+
+    def cleanup(self) -> None:
+        pass
+
+
 async def _nudge_player() -> str:
     """Kick a stalled player. Returns a short description of what was tried."""
     try:
@@ -447,6 +556,7 @@ async def _nudge_player() -> str:
 
 def _new_source() -> StudioAudio:
     device = _sink_name()
+    _wake_sink(device)
     url = f"{URL}/api/audio/stream.mp3?api_key={KEY}"
     return StudioAudio(url, device)
 
@@ -835,12 +945,8 @@ class MusicCog(commands.Cog):
 
     # ---------- voice ----------
 
-    async def _ensure_voice(self, interaction: discord.Interaction):
-        """Join (or move to) the requester's voice channel and start the live stream.
-
-        Returns (voice_client, why_not). `why_not` is a sentence a person can
-        act on when we couldn't bring audio, and None when we did.
-        """
+    async def _join(self, interaction: discord.Interaction):
+        """Join (or move to) the asker's voice channel. Returns (vc, why_not)."""
         user = getattr(interaction, "user", None)
         if not user or not getattr(user, "voice", None) or not user.voice.channel:
             return None, "join a voice channel first and I'll bring the music 🎧"
@@ -853,6 +959,17 @@ class MusicCog(commands.Cog):
             vc = await ch.connect(self_deaf=True)
         elif vc.channel != ch:
             await vc.move_to(ch)
+        return vc, None
+
+    async def _ensure_voice(self, interaction: discord.Interaction):
+        """Join the requester's voice channel and start the live stream.
+
+        Returns (voice_client, why_not). `why_not` is a sentence a person can
+        act on when we couldn't bring audio, and None when we did.
+        """
+        vc, why_not = await self._join(interaction)
+        if vc is None:
+            return None, why_not
         if vc.is_playing():
             return vc, None
         # Attach and then check the audio itself. Every earlier version of this
@@ -868,12 +985,17 @@ class MusicCog(commands.Cog):
         """Attach the studio's audio and confirm sound flows. None on success."""
         if not _configured():
             return "the studio isn't wired up yet 🎧"
+        # One player at a time. Leaving the old one attached leaked an ffmpeg
+        # per restart, all of them reading the same monitor.
+        self._stop_voice(vc)
+        await asyncio.sleep(0.05)
         source = await asyncio.to_thread(_new_source)
         vc.play(source)
         await asyncio.sleep(1.5)
         if source.frames and source.sounding():
-            log.info("audio attached: mode=%s frames=%d silent=%d",
-                     source.mode, source.frames, source.silent_frames)
+            log.info("audio attached: mode=%s frames=%d silent=%d stalled=%d",
+                     source.mode, source.frames, source.silent_frames,
+                     source.stalled_frames)
             return None
         if source.frames == 0:
             source.cleanup()
@@ -906,6 +1028,46 @@ class MusicCog(commands.Cog):
         except Exception:
             pass
 
+    async def _audio_report(self, vc) -> str:
+        """The facts about each link in the chain, for /voicecheck.
+
+        Written to be readable by a person and useful to me: every line is a
+        link that can be the broken one.
+        """
+        lines = []
+        runtime = os.environ.get("XDG_RUNTIME_DIR") or "/tmp/pulse-runtime"
+        lines.append(f"**pulse** `{runtime}` "
+                     f"({'ok' if os.path.isdir(runtime) else 'missing'})")
+        sink = await asyncio.to_thread(_sink_name)
+        lines.append(f"**sink** `{sink}`" if sink
+                     else "**sink** none — falling back to the HTTP stream")
+        try:
+            out = await asyncio.to_thread(lambda: subprocess.run(
+                ["pactl", "list", "short", "sink-inputs"],
+                capture_output=True, text=True, timeout=5, env=_pulse_env()))
+            feeds = [l for l in (out.stdout or "").splitlines() if l.strip()]
+            lines.append(f"**sink inputs** {len(feeds)} "
+                         f"({'the studio is feeding it' if feeds else 'NOTHING is feeding it'})")
+        except Exception as exc:
+            lines.append(f"**sink inputs** unreadable ({type(exc).__name__})")
+        try:
+            np = await _get("/playback/now-playing")
+            lines.append(f"**player** {np.get('title') or 'nothing'} · "
+                         f"playing={np.get('isPlaying')} · state={np.get('state')}")
+        except Exception:
+            lines.append("**player** not answering")
+        src = getattr(vc, "source", None)
+        if src is None:
+            lines.append("**source** attached but idle")
+        else:
+            lines.append(f"**source** {getattr(src, 'mode', type(src).__name__)} · "
+                         f"{getattr(src, 'frames', 0)} frames · "
+                         f"{getattr(src, 'silent_frames', 0)} silent · "
+                         f"dead={getattr(src, 'dead', '?')}")
+        lines.append(f"**voice** {getattr(getattr(vc, 'channel', None), 'name', '?')} · "
+                     f"connected={vc.is_connected()}")
+        return "\n".join(lines)
+
     async def _np_watcher(self, guild: discord.Guild):
         """While a voice party is live: post track changes, and keep the audio up.
 
@@ -931,8 +1093,10 @@ class MusicCog(commands.Cog):
             except Exception:
                 log.debug("np watcher hiccup", exc_info=True)
             source = getattr(vc, "source", None)
+            # A stalled source (frames still arriving, or the capture blocked
+            # on a suspended sink) is dead air, and is_playing() cannot see it.
             stalled = isinstance(source, StudioAudio) and (
-                source.dead or source.silent_seconds() >= 20)
+                source.dead or source.silent_seconds() >= 10)
             if (not vc.is_playing() or stalled) and failures < 3:
                 why = await self._start_stream(vc)
                 if why:
@@ -941,7 +1105,12 @@ class MusicCog(commands.Cog):
                 else:
                     failures = 0
                     log.info("stream restarted in %s", getattr(vc.channel, "name", "?"))
-            await asyncio.sleep(20)
+            if isinstance(source, StudioAudio):
+                log.info("stream telemetry: frames=%d silent_s=%.1f stalled=%d "
+                         "dead=%s playing=%s", source.frames,
+                         source.silent_seconds(), source.stalled_frames,
+                         source.dead, vc.is_playing())
+            await asyncio.sleep(8)
 
     # ---------- shared play plumbing ----------
 
@@ -1178,6 +1347,46 @@ class MusicCog(commands.Cog):
             "🎧 **listening party started** — playing the studio's live "
             "session here. track changes land in the listening post.",
             allowed_mentions=mt["allowed"])
+
+    @app_commands.command(name="voicecheck",
+                          description="Test whether my audio reaches you: plays a 6s tone")
+    async def voicecheck(self, interaction: discord.Interaction):
+        """Play a tone that owes nothing to the studio, then print every link.
+
+        "i can't hear it" has three different causes and I can only see the
+        middle one from in here. A tone the sandbox generates itself separates
+        them: hear the beep but not the music -> the studio's audio is at
+        fault; hear neither -> my packets leave and don't arrive, and no amount
+        of studio debugging will help.
+        """
+        await interaction.response.defer(ephemeral=True)
+        vc, why_not = await self._join(interaction)
+        if vc is None:
+            return await interaction.followup.send(
+                f"🎧 {why_not or 'i could not join that channel'}", ephemeral=True)
+        loop = asyncio.get_running_loop()
+        self._stop_voice(vc)
+        tone = ToneSource(seconds=6)
+
+        def after(exc):
+            if exc:
+                log.warning("test tone ended with an error: %s", exc)
+            else:
+                log.info("test tone finished: %d frames sent", tone.frames)
+            asyncio.run_coroutine_threadsafe(self._start_stream(vc), loop)
+
+        vc.play(tone, after=after)
+        await asyncio.sleep(1.0)
+        report = await self._audio_report(vc)
+        embed = discord.Embed(
+            title="voice check — listen for a steady beep",
+            description=(report + "\n\n**6 seconds of beep, then the studio's music "
+                         "starts.** if you hear the beep but not the music, the fault "
+                         "is the studio's audio. if you hear neither, my packets are "
+                         "leaving this box and not arriving at your ears."),
+            colour=0x2ECC71)
+        embed.set_footer(text="tell me which of the two you got — that's the whole diagnosis")
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     async def _simple_command(self, interaction: discord.Interaction, cmd: str, ack: str):
         if not _configured():
