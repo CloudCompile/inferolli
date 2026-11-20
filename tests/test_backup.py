@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from cogs import backup
+from cogs import music
 
 
 class TarballTests(unittest.TestCase):
@@ -123,6 +124,24 @@ class RestoreTonearmTests(unittest.TestCase):
         self.assertFalse((backup.DATA_DIR.parent / "tonearm").exists(),
                          "must not drop a stray tonearm/ into /bot")
         self.assertIn("restored brain", summary)
+
+    def test_the_music_ledger_rides_along_with_the_cortex(self):
+        """data/music.json says which playlists the bot may edit. If a restore
+        lost it, every playlist it made would silently become foreign (edits
+        refused) — safe, but broken. It must be inside data/ and restored."""
+        # music.py sits in cogs/, so its default ledger is <repo>/data/music.json
+        self.assertEqual(music.STATE_FILE.parent,
+                         Path(backup.__file__).resolve().parent.parent / "data")
+        (backup.DATA_DIR / "music.json").write_text('{"playlists": {"p.mine": {}}}')
+        s3 = mock.Mock()
+        s3.list_objects_v2.return_value = {}  # empty backups/ prefix
+        with mock.patch.object(backup, "_configured", lambda: True), \
+             mock.patch.object(backup, "_s3", lambda: s3), \
+             mock.patch.dict(os.environ, {"S3_BUCKET": "b"}):
+            backup.run_backup()
+        blob = s3.put_object.call_args_list[0][1]["Body"]  # first put = data.tar.gz
+        names = tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz").getnames()
+        self.assertIn("data/music.json", names)
 
 
 class ConfigTests(unittest.TestCase):
