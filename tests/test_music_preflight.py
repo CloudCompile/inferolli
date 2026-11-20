@@ -608,28 +608,120 @@ class SinkWakeTests(unittest.TestCase):
 
 
 class VoiceEncryptionTests(unittest.TestCase):
-    """The bug that outlived every other fix.
+    """DAVE (E2EE) is mandatory, and it has to actually encrypt.
 
-    discord.py speaks DAVE (E2EE) when `davey` is installed. Here the session
-    never became ready, so every frame went out with the legacy scheme — and a
-    DAVE call DISCARDS legacy frames. Real tone, 50 packets a second, total
-    silence at the listener. Nothing on our side could see it, so the fix is
-    to not ask for E2EE at all.
+    Two separate bugs lived here:
+
+    1. Discord enforces A/V E2EE for non-stage calls and closes the voice
+       websocket with code 4017 ("E2EE/DAVE protocol required") when a client
+       advertises max_dave_protocol_version=0. Opting out is a refusal, not a
+       downgrade.
+
+    2. discord.py 2.7.1 gates encryption on `dave_session.ready`, which davey
+       0.2.0 never sets (the field is now `can_encrypt`). Measured live: MLS
+       status=active, 2 members, key present — and can_encrypt False for the
+       whole session, so every frame went out legacy and every DAVE client
+       threw it away.
     """
 
-    def test_we_do_not_advertise_dave(self):
+    def test_dave_stays_advertised_by_default(self):
+        import discord.voice_state as voice_state
+        before = voice_state.VoiceConnectionState.max_dave_protocol_version
         music._prefer_plain_voice()
+        self.assertIs(voice_state.VoiceConnectionState.max_dave_protocol_version, before)
+
+    def test_the_encryption_gate_uses_the_field_davey_actually_sets(self):
+        music._prefer_plain_voice()
+        import discord.voice_state as voice_state
+        conn = voice_state.VoiceConnectionState.__new__(voice_state.VoiceConnectionState)
+        conn.dave_protocol_version = 1
+        conn.dave_session = mock.Mock(ready=False, can_encrypt=True)
+        self.assertTrue(conn.can_encrypt, "a ready key must be used")
+
+    def test_no_key_means_no_encryption(self):
+        music._prefer_plain_voice()
+        import discord.voice_state as voice_state
+        conn = voice_state.VoiceConnectionState.__new__(voice_state.VoiceConnectionState)
+        conn.dave_protocol_version = 1
+        conn.dave_session = mock.Mock(ready=False, can_encrypt=False)
+        self.assertFalse(conn.can_encrypt)
+
+    def test_older_davey_falls_back_to_ready(self):
+        music._prefer_plain_voice()
+        import discord.voice_state as voice_state
+        conn = voice_state.VoiceConnectionState.__new__(voice_state.VoiceConnectionState)
+        conn.dave_protocol_version = 1
+        session = mock.Mock(ready=True)
+        del session.can_encrypt
+        conn.dave_session = session
+        self.assertTrue(conn.can_encrypt)
+
+    def test_advertising_zero_requires_an_explicit_flag(self):
+        import os
+        with mock.patch.dict(os.environ, {"TONEARM_VOICE_NO_E2EE": "1"}):
+            music._prefer_plain_voice()
         import discord.voice_state as voice_state
         conn = voice_state.VoiceConnectionState.__new__(voice_state.VoiceConnectionState)
         self.assertEqual(conn.max_dave_protocol_version, 0)
 
-    def test_the_escape_hatch_leaves_the_property_alone(self):
-        import os
-        import discord.voice_state as voice_state
-        before = voice_state.VoiceConnectionState.max_dave_protocol_version
-        with mock.patch.dict(os.environ, {"TONEARM_VOICE_E2EE": "1"}):
-            music._prefer_plain_voice()
-        self.assertIs(voice_state.VoiceConnectionState.max_dave_protocol_version, before)
+
+class E2EEGateTests(unittest.TestCase):
+    """Frames sent before the DAVE session is ready are discarded silently.
+
+    Measured earlier: a real tone (272-byte opus packets) at 50 packets/s, and
+    total silence at the listener, because the session was not ready and the
+    packets went out with the legacy scheme.
+    """
+
+    def run_async(self, coro):
+        return asyncio.run(coro)
+
+    def _cog(self):
+        return music.MusicCog(bot=mock.Mock())
+
+    def _vc(self, can_encrypt, connected=True):
+        vc = mock.Mock()
+        vc.is_connected.return_value = connected
+        conn = mock.Mock()
+        conn.can_encrypt = can_encrypt
+        conn.dave_protocol_version = 1
+        conn.dave_session = mock.Mock(ready=can_encrypt)
+        vc._connection = conn
+        return vc
+
+    def test_an_encryptable_link_passes_immediately(self):
+        with mock.patch("asyncio.sleep", mock.AsyncMock()):
+            self.assertEqual(self.run_async(self._cog()._wait_e2ee(self._vc(True))), "")
+
+    def test_a_link_that_cannot_encrypt_is_refused_with_a_reason(self):
+        ticks = [0.0]
+
+        def ticking():
+            ticks[0] += 1.0
+            return ticks[0]
+
+        with mock.patch("asyncio.sleep", mock.AsyncMock()), \
+             mock.patch.object(music.time, "monotonic", ticking):
+            why = self.run_async(self._cog()._wait_e2ee(self._vc(False), timeout=5))
+        self.assertIn("encryption handshake", why)
+        self.assertIn("dave=1", why)
+
+    def test_a_link_that_drops_is_not_played_into(self):
+        vc = self._vc(False, connected=False)
+        with mock.patch("asyncio.sleep", mock.AsyncMock()):
+            self.assertIn("dropped", self.run_async(self._cog()._wait_e2ee(vc)))
+
+    def test_the_stream_does_not_attach_before_encryption_is_ready(self):
+        cog = self._cog()
+        vc = self._vc(False)
+        with mock.patch.object(music, "_configured", mock.Mock(return_value=True)), \
+             mock.patch.object(music, "_new_source") as new_source, \
+             mock.patch.object(cog, "_wait_e2ee", mock.AsyncMock(return_value="not ready")), \
+             mock.patch("asyncio.sleep", mock.AsyncMock()):
+            why = self.run_async(cog._start_stream(vc))
+        self.assertEqual(why, "not ready")
+        new_source.assert_not_called()
+        vc.play.assert_not_called()
 
 
 class VoiceReadinessTests(unittest.TestCase):

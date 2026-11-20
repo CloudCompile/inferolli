@@ -979,33 +979,64 @@ async def _ac_add_source(interaction: discord.Interaction, current: str):
 
 # ---------------------------------------------------------------- cog
 
-def _prefer_plain_voice() -> None:
-    """Stop Discord putting our voice connection inside an E2EE (DAVE) call.
+def _voice_can_encrypt(self) -> bool:
+    """Whether this connection may encrypt frames (discord.py's own gate).
 
-    discord.py 2.7 speaks DAVE whenever the `davey` package is installed, and
-    this sandbox has it — so a connection negotiates E2EE (protocol v1). Here
-    the session never reaches `ready`, which means every frame we send goes out
-    with the LEGACY encryption scheme. A DAVE call discards legacy frames.
+    discord.py 2.7.1 asks `dave_session.ready`, but davey 0.2.0 replaced that
+    with `can_encrypt`: in 0.2.0 `ready` stays False even once the MLS group is
+    established, while `can_encrypt` becomes True. The migration guide is
+    explicit — "we stop sending frames until we have a key to encrypt with".
 
-    That is the failure that survived every other fix: the bot encoded a real
-    tone, sent 50 packets a second, kept the timeline perfect — and every
-    listener's client threw all of it away. Nothing observable on our side says
-    a word about it, because the packets really were sent.
-
-    Advertising protocol version 0 makes Discord downgrade the call to the
-    legacy scheme (and davey switches to passthrough), which is the right
-    trade for a music bot streaming a public track. Set TONEARM_VOICE_E2EE=1
-    to keep the default and try to make E2EE work instead.
+    With the stale flag, `can_encrypt` here was False forever, so
+    `_get_voice_packet` sent every frame with the LEGACY scheme. Discord now
+    enforces DAVE, and a DAVE call DISCARDS legacy frames: real tone, 50
+    packets a second, silence at every listener, nothing wrong in our logs.
+    That is the bug that survived every other fix.
     """
-    if os.environ.get("TONEARM_VOICE_E2EE") == "1":
+    session = self.dave_session
+    if self.dave_protocol_version == 0 or session is None:
+        return False
+    flag = getattr(session, "can_encrypt", None)
+    if flag is None:
+        flag = getattr(session, "ready", False)
+    return bool(flag)
+
+
+def _prefer_plain_voice() -> None:
+    """Wire up Discord's mandatory DAVE (E2EE) so our audio is actually heard.
+
+    Two things matter, and each one cost a debugging session:
+
+    1. DAVE can NOT be opted out of any more. Discord enforces A/V E2EE for
+       non-stage voice calls and closes the voice websocket with code 4017
+       ("E2EE/DAVE protocol required") for a client that advertises
+       max_dave_protocol_version=0. That was the retry loop that looked like
+       "it joins for half a second and leaves".
+
+    2. The connection must encrypt. davey 0.2.0 exposes `can_encrypt`, and
+       discord.py 2.7.1 checks the older `ready` instead, which never becomes
+       true — so the link silently falls back to legacy frames that DAVE
+       clients drop.
+
+    TONEARM_VOICE_NO_E2EE=1 still forces the old opt-out for diagnostics.
+    """
+    if os.environ.get("TONEARM_VOICE_NO_E2EE") == "1":
+        try:
+            import discord.voice_state as _voice_state
+            _voice_state.VoiceConnectionState.max_dave_protocol_version = property(
+                lambda self: 0)
+            log.warning("voice: E2EE disabled by TONEARM_VOICE_NO_E2EE — modern "
+                        "Discord closes this with 4017")
+        except Exception:
+            log.warning("could not disable DAVE", exc_info=True)
         return
+
     try:
         import discord.voice_state as _voice_state
-        _voice_state.VoiceConnectionState.max_dave_protocol_version = property(
-            lambda self: 0)
-        log.info("voice: E2EE/DAVE disabled for our connections")
+        _voice_state.VoiceConnectionState.can_encrypt = property(_voice_can_encrypt)
+        log.info("voice: DAVE wired up (can_encrypt <- davey can_encrypt)")
     except Exception:
-        log.warning("could not disable DAVE — voice may be inaudible", exc_info=True)
+        log.warning("could not wire up DAVE — voice may be inaudible", exc_info=True)
 
 
 class MusicCog(commands.Cog):
@@ -1080,10 +1111,54 @@ class MusicCog(commands.Cog):
             return None, why
         return vc, None
 
+    async def _wait_e2ee(self, vc, timeout: float = 15.0) -> str:
+        """Wait until the voice link can actually encrypt what we send.
+
+        Frames sent before DAVE is ready go out with the LEGACY scheme, and
+        every listener discards them — real tone, 50 packets a second, total
+        silence, and nothing on our side complains. That is why "it says it is
+        playing" and "nobody hears anything" lived together for so long.
+
+        Returns "" when the link can encrypt, or a sentence explaining what it
+        is stuck on.
+        """
+        conn = getattr(vc, "_connection", None)
+        if conn is None:
+            return "the voice client has no connection object"
+        started = time.monotonic()
+        seen = None
+        while time.monotonic() - started < timeout:
+            if getattr(conn, "can_encrypt", False):
+                if seen is not None:
+                    log.info("voice: E2EE ready after %.1fs (dave=%s)",
+                             time.monotonic() - started,
+                             getattr(conn, "dave_protocol_version", "?"))
+                return ""
+            if not vc.is_connected():
+                return "the voice link dropped while setting up encryption"
+            await asyncio.sleep(0.25)
+        version = getattr(conn, "dave_protocol_version", None)
+        ready = getattr(getattr(conn, "dave_session", None), "ready", None)
+        log.warning("voice: E2EE never became ready (dave=%s ready=%s)", version, ready)
+        return (f"i'm in the channel but Discord's encryption handshake didn't finish "
+                f"(dave={version}, ready={ready}), so anything i played would be "
+                f"dropped. try again in a moment")
+
+    def _voice_state_report(self, vc) -> str:
+        conn = getattr(vc, "_connection", None)
+        if conn is None:
+            return "dave=? · ready=?"
+        return (f"dave={getattr(conn, 'dave_protocol_version', '?')} · "
+                f"e2ee_ready={getattr(getattr(conn, 'dave_session', None), 'ready', '?')} · "
+                f"can_encrypt={getattr(conn, 'can_encrypt', '?')}")
+
     async def _start_stream(self, vc) -> str | None:
         """Attach the studio's audio and confirm sound flows. None on success."""
         if not _configured():
             return "the studio isn't wired up yet 🎧"
+        why = await self._wait_e2ee(vc)
+        if why:
+            return why
         # One player at a time. Leaving the old one attached leaked an ffmpeg
         # per restart, all of them reading the same monitor.
         self._stop_voice(vc)
@@ -1163,12 +1238,8 @@ class MusicCog(commands.Cog):
                          f"{getattr(src, 'frames', 0)} frames · "
                          f"{getattr(src, 'silent_frames', 0)} silent · "
                          f"dead={getattr(src, 'dead', '?')}")
-        conn = getattr(vc, "_connection", None)
-        dave = getattr(conn, "dave_protocol_version", None)
-        ready = getattr(getattr(conn, "dave_session", None), "ready", None)
         lines.append(f"**voice** {getattr(getattr(vc, 'channel', None), 'name', '?')} · "
-                     f"connected={vc.is_connected()} · dave={dave} · "
-                     f"e2ee_ready={ready}")
+                     f"connected={vc.is_connected()} · {self._voice_state_report(vc)}")
         return "\n".join(lines)
 
     async def _np_watcher(self, guild: discord.Guild):
@@ -1468,6 +1539,11 @@ class MusicCog(commands.Cog):
             return await interaction.followup.send(
                 f"🎧 {why_not or 'i could not join that channel'}", ephemeral=True)
         loop = asyncio.get_running_loop()
+        # Do not pretend to test audio over a link that cannot carry it yet:
+        # frames sent before the DAVE session is ready are discarded by every
+        # listener. Waiting here is the difference between "the tone is
+        # inaudible" and "the tone was never going to be audible".
+        e2ee = await self._wait_e2ee(vc)
         self._stop_voice(vc)
         tone = ToneSource(seconds=6)
 
@@ -1500,8 +1576,9 @@ class MusicCog(commands.Cog):
             description=(report + "\n\n**6 seconds of beep, then the studio's music "
                          "starts.** if you hear the beep but not the music, the fault "
                          "is the studio's audio. if you hear neither, my packets are "
-                         "leaving this box and not arriving at your ears."),
-            colour=0x2ECC71)
+                         "leaving this box and not arriving at your ears."
+                         + (f"\n\n⚠️ **encryption:** {e2ee}" if e2ee else "")),
+            colour=0xE67E22 if e2ee else 0x2ECC71)
         embed.set_footer(text="tell me which of the two you got — that's the whole diagnosis")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
