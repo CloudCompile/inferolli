@@ -286,6 +286,20 @@ class ClientMuteTests(unittest.TestCase):
             self.assertEqual(
                 asyncio.run(self._cog()._unmute_client_voice(self._user(False))), "")
 
+    def test_the_report_uses_the_live_runtime_not_the_env(self):
+        """The unit's env can name a dir with no socket; the report must not."""
+        vc = mock.Mock()
+        vc.is_connected.return_value = True
+        vc.source = None
+        vc.channel = mock.Mock(name="hangout-voice")
+        with mock.patch.object(music, "_pulse_runtime", mock.Mock(return_value="/run/user/1000")), \
+             mock.patch.object(music, "_sink_name", mock.Mock(return_value="inferolli_studio")), \
+             mock.patch.object(music, "_sink_inputs_listing", mock.Mock(return_value="")), \
+             mock.patch.object(music, "_get", mock.AsyncMock(return_value={})):
+            report = asyncio.run(self._cog()._audio_report(vc))
+        self.assertIn("/run/user/1000", report)
+        self.assertNotIn("pulse-runtime", report)
+
     def test_the_report_names_a_muted_client_stream(self):
         vc = mock.Mock()
         vc.is_connected.return_value = True

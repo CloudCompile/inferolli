@@ -1294,9 +1294,9 @@ class MusicCog(commands.Cog):
         link that can be the broken one.
         """
         lines = []
-        runtime = os.environ.get("XDG_RUNTIME_DIR") or "/tmp/pulse-runtime"
-        lines.append(f"**pulse** `{runtime}` "
-                     f"({'ok' if os.path.isdir(runtime) else 'missing'})")
+        runtime = await asyncio.to_thread(_pulse_runtime)
+        lines.append(f"**pulse** `{runtime or 'none'}` "
+                     f"({'ok' if runtime else 'no live socket'})")
         sink = await asyncio.to_thread(_sink_name)
         lines.append(f"**sink** `{sink}`" if sink
                      else "**sink** none — falling back to the HTTP stream")
