@@ -943,11 +943,41 @@ async def _ac_add_source(interaction: discord.Interaction, current: str):
 
 # ---------------------------------------------------------------- cog
 
+def _prefer_plain_voice() -> None:
+    """Stop Discord putting our voice connection inside an E2EE (DAVE) call.
+
+    discord.py 2.7 speaks DAVE whenever the `davey` package is installed, and
+    this sandbox has it — so a connection negotiates E2EE (protocol v1). Here
+    the session never reaches `ready`, which means every frame we send goes out
+    with the LEGACY encryption scheme. A DAVE call discards legacy frames.
+
+    That is the failure that survived every other fix: the bot encoded a real
+    tone, sent 50 packets a second, kept the timeline perfect — and every
+    listener's client threw all of it away. Nothing observable on our side says
+    a word about it, because the packets really were sent.
+
+    Advertising protocol version 0 makes Discord downgrade the call to the
+    legacy scheme (and davey switches to passthrough), which is the right
+    trade for a music bot streaming a public track. Set TONEARM_VOICE_E2EE=1
+    to keep the default and try to make E2EE work instead.
+    """
+    if os.environ.get("TONEARM_VOICE_E2EE") == "1":
+        return
+    try:
+        import discord.voice_state as _voice_state
+        _voice_state.VoiceConnectionState.max_dave_protocol_version = property(
+            lambda self: 0)
+        log.info("voice: E2EE/DAVE disabled for our connections")
+    except Exception:
+        log.warning("could not disable DAVE — voice may be inaudible", exc_info=True)
+
+
 class MusicCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._np_task = None
         self._last_track = None
+        _prefer_plain_voice()
 
     # ---------- voice ----------
 
@@ -1070,8 +1100,12 @@ class MusicCog(commands.Cog):
                          f"{getattr(src, 'frames', 0)} frames · "
                          f"{getattr(src, 'silent_frames', 0)} silent · "
                          f"dead={getattr(src, 'dead', '?')}")
+        conn = getattr(vc, "_connection", None)
+        dave = getattr(conn, "dave_protocol_version", None)
+        ready = getattr(getattr(conn, "dave_session", None), "ready", None)
         lines.append(f"**voice** {getattr(getattr(vc, 'channel', None), 'name', '?')} · "
-                     f"connected={vc.is_connected()}")
+                     f"connected={vc.is_connected()} · dave={dave} · "
+                     f"e2ee_ready={ready}")
         return "\n".join(lines)
 
     async def _np_watcher(self, guild: discord.Guild):

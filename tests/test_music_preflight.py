@@ -544,3 +544,28 @@ class SinkWakeTests(unittest.TestCase):
     def test_a_missing_pactl_does_not_raise(self):
         with mock.patch.object(music.subprocess, "run", mock.Mock(side_effect=FileNotFoundError)):
             music._wake_sink("tonearm_audio")  # must not raise
+
+
+class VoiceEncryptionTests(unittest.TestCase):
+    """The bug that outlived every other fix.
+
+    discord.py speaks DAVE (E2EE) when `davey` is installed. Here the session
+    never became ready, so every frame went out with the legacy scheme — and a
+    DAVE call DISCARDS legacy frames. Real tone, 50 packets a second, total
+    silence at the listener. Nothing on our side could see it, so the fix is
+    to not ask for E2EE at all.
+    """
+
+    def test_we_do_not_advertise_dave(self):
+        music._prefer_plain_voice()
+        import discord.voice_state as voice_state
+        conn = voice_state.VoiceConnectionState.__new__(voice_state.VoiceConnectionState)
+        self.assertEqual(conn.max_dave_protocol_version, 0)
+
+    def test_the_escape_hatch_leaves_the_property_alone(self):
+        import os
+        import discord.voice_state as voice_state
+        before = voice_state.VoiceConnectionState.max_dave_protocol_version
+        with mock.patch.dict(os.environ, {"TONEARM_VOICE_E2EE": "1"}):
+            music._prefer_plain_voice()
+        self.assertIs(voice_state.VoiceConnectionState.max_dave_protocol_version, before)
