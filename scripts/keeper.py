@@ -117,6 +117,11 @@ def run_once(key: str | None = None, create_if_missing: bool = True) -> dict:
 
     running = [r for r in list_sandboxes(key, "running") if is_inferolli(r)]
     report["running"] = [r.get("sandboxID") for r in running]
+    if len(running) > 1:
+        # two running bot sandboxes share one Discord token: both answer, and
+        # the reply rate doubles. Not the keeper's job to kill anything — just
+        # say it out loud, because it is invisible from Discord.
+        report["duplicates"] = [r.get("sandboxID") for r in running[1:]]
     if running:
         # one is enough; extras belong to the VPS shepherd's cleanup
         for row in running:
@@ -174,6 +179,8 @@ def main(argv: list[str]) -> int:
     else:
         print(f"running: {report['running'] or 'none'}")
         print(f"resumed: {report['resumed'] or 'none'}")
+        if report.get("duplicates"):
+            print(f"WARNING more than one bot is running on this token: {report['duplicates']}")
         if report.get("created"):
             print(f"created: {report['created']}")
         if report.get("left_paused"):

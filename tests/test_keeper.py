@@ -71,6 +71,16 @@ class RunOnceTests(unittest.TestCase):
         self.assertEqual(report["resumed"], [])
         self.assertIn(("POST", "/sandboxes/live00000000000001/timeout", {"timeout": 3600}), calls)
 
+    def test_two_running_bots_are_reported(self):
+        second = dict(LIVE, sandboxID="live00000000000002")
+
+        def fake_req(method, path, key, body=None, params=None, timeout=30):
+            return (200, [LIVE, second]) if path == "/v2/sandboxes" else (204, None)
+
+        with mock.patch.object(keeper, "_req", fake_req):
+            report = keeper.run_once("k")
+        self.assertEqual(report["duplicates"], ["live00000000000002"])
+
     def test_paused_sandbox_is_resumed_then_extended(self):
         calls = []
 
