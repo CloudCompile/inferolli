@@ -31,6 +31,7 @@ for line in (ROOT / ".env").read_text().splitlines():
 from cogs import music  # noqa: E402
 
 VOICE = 1570609109802418239
+SECONDS = float(next((a.split('=')[1] for a in sys.argv if a.startswith('--seconds=')), 3))
 TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 
 
@@ -77,7 +78,7 @@ async def on_ready():
         await vc.disconnect()
         return await client.close()
 
-    say(f"--> E2EE ready after {time.monotonic() - t0:.1f}s: sending a 3s tone")
+    say(f"--> E2EE ready after {time.monotonic() - t0:.1f}s: sending a {SECONDS:g}s tone")
 
     captured = {"tone": [], "silence": []}
     current = ["tone"]
@@ -89,8 +90,8 @@ async def on_ready():
 
     conn.send_packet = logged
 
-    vc.play(music.ToneSource(seconds=3))
-    await asyncio.sleep(3.4)
+    vc.play(music.ToneSource(seconds=SECONDS))
+    await asyncio.sleep(SECONDS + 0.4)
     vc.stop()
     await asyncio.sleep(0.3)
 
